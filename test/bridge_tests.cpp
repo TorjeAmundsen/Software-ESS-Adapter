@@ -319,6 +319,10 @@ static void test_ess_range() {
     // The dead zone runs after the ESS range and is scaled with it. Two properties for each range
     // start: at its largest (range start - 1) it zeroes everything that would read 1 to 7 in game
     // and none of ESS; and with the default range, N = 2 zeroes everything that reads 2 or less.
+    // Range start 3 puts the dead zone's edge 4 stick units from center, where the ESS range's
+    // rounding moves a stick in and out of the dead zone as one axis rises. Keeping each axis from
+    // dropping (step 5 of process_stick) then lets a few spots at the edge read up to 7 in game,
+    // which is still OoT's own dead zone, so it only checks that ESS is untouched there.
     auto pipeline = [](int x, int y, int start, int end, int dead_zone, int game[2]) {
         uint8_t s[2] = {static_cast<uint8_t>(128 + x), static_cast<uint8_t>(128 + y)};
         StickSettings settings;
@@ -337,7 +341,7 @@ static void test_ess_range() {
                 int game[2];
                 pipeline(x, y, start, end, largest, game);
                 const bool game_dead_zone = std::abs(game[0]) <= 7 && std::abs(game[1]) <= 7;
-                ok = ok && (!game_dead_zone || (game[0] == 0 && game[1] == 0));
+                ok = ok && (range_start == 3 || !game_dead_zone || (game[0] == 0 && game[1] == 0));
             }
         }
         int first_ess[2];
@@ -465,6 +469,47 @@ static void test_dsu_server() {
     server.stop();
 }
 
+static void test_axes_monotonic() {
+    // Speedrun rule: with one input axis held, raising the other axis's input must never move that
+    // axis's output closer to center. Checked with the defaults, which the ESS map alone breaks
+    // near the diagonals, and with notches rotated 5 degrees, which the warp alone breaks.
+    NotchCalibration rotated;
+    const double turn = 5 * 3.14159265358979 / 180;
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        const double x = IDEAL_NOTCHES[i][0] * 0.95, y = IDEAL_NOTCHES[i][1] * 0.95;
+        rotated.notch[i][0] = static_cast<int8_t>(std::lround(x * std::cos(turn) - y * std::sin(turn)));
+        rotated.notch[i][1] = static_cast<int8_t>(std::lround(x * std::sin(turn) + y * std::cos(turn)));
+    }
+    rotated.valid = true;
+    StickSettings settings;
+    settings.dead_zone_distance = physical_dead_zone(DEAD_ZONE_DEFAULT);
+    for (const NotchCalibration& cal : {NotchCalibration{}, rotated}) {
+        bool ok = true;
+        for (int axis = 0; axis < 2 && ok; ++axis) {
+            for (int held = -105; held <= 105 && ok; ++held) {
+                for (const int direction : {1, -1}) {
+                    int previous = 0;
+                    for (int moved = 0; moved <= 105; ++moved) {
+                        uint8_t s[2];
+                        s[1 - axis] = static_cast<uint8_t>(128 + held);
+                        s[axis] = static_cast<uint8_t>(128 + direction * moved);
+                        process_stick(s, cal, settings);
+                        const int out = std::abs(s[axis] - 128);
+                        if (out < previous) {
+                            std::printf("axis %d at %d (other held at %d) dropped to %d after %d\n", axis, direction * moved, held, out,
+                                        previous);
+                            ok = false;
+                            break;
+                        }
+                        previous = out;
+                    }
+                }
+            }
+        }
+        CHECK(ok);
+    }
+}
+
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -475,6 +520,7 @@ int main() {
     test_notch_warp_and_snap();
     test_vc_and_conversion();
     test_ess_range();
+    test_axes_monotonic();
     test_dsu_server();
     WSACleanup();
     std::printf(failures ? "%d FAILED\n" : "all passed\n", failures);
