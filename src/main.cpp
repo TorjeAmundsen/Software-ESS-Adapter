@@ -269,6 +269,7 @@ static void load_settings() {
             for (int i = 0; i < NOTCH_COUNT * 2; ++i) {
                 calibration.notch[i / 2][i % 2] = static_cast<int8_t>(notches[i]);
             }
+            calibration.valid = misplaced_notch(calibration) < 0;  // a hand-edited file could break the warp
         }
         g_notches[p] = calibration;
     }
@@ -459,12 +460,25 @@ static void bridge_loop() {
                     set_notice("Port " + std::to_string(p + 1) + " calibration cancelled.");
                 } else if (a && !prev_a[p]) {
                     const int step = g_calibration_step;
+                    const int notch = notch_of_step(step);
+                    auto ask_again = [](int i) {
+                        set_notice(std::string("That's not the ") + NOTCH_NAMES[i] + " notch. Hold it and press A again.");
+                    };
+                    // Neutral isn't known yet, so check against the current center. The finished
+                    // calibration is checked again against the real neutral below.
+                    const int x = raw[p].stick[0] - port_origin.stick[0];
+                    const int y = raw[p].stick[1] - port_origin.stick[1];
                     samples[step][0] = raw[p].stick[0];
                     samples[step][1] = raw[p].stick[1];
-                    if (step + 1 < CALIBRATION_STEPS) {
+                    if (!is_neutral_step(step) && !notch_in_section(notch, x, y)) {
+                        ask_again(notch);
+                    } else if (step + 1 < CALIBRATION_STEPS) {
                         g_calibration_step = step + 1;
+                    } else if (const NotchCalibration calibration = make_calibration(samples); misplaced_notch(calibration) >= 0) {
+                        const int misplaced = misplaced_notch(calibration);
+                        g_calibration_step = 2 * misplaced;
+                        ask_again(misplaced);
                     } else {
-                        const NotchCalibration calibration = make_calibration(samples);
                         save_notches(p, calibration);
                         {
                             std::lock_guard lock(g_mutex);
@@ -630,7 +644,9 @@ static void refresh_settings(HWND hwnd) {
         const std::string port = std::to_string(calibrating + 1);
         const int step = g_calibration_step;
         const std::string progress = " (" + std::to_string(step + 1) + "/" + std::to_string(CALIBRATION_STEPS) + "). B cancels.";
-        if (!raw[calibrating].connected) {
+        if (!notice.empty()) {
+            prompt = "Port " + port + ": " + notice;
+        } else if (!raw[calibrating].connected) {
             prompt = "Port " + port + " calibration: plug in a controller.";
         } else if (is_neutral_step(step)) {
             prompt = "Port " + port + ": let go of the stick, press A" + progress;
@@ -947,6 +963,7 @@ static void on_settings_command(HWND hwnd, int id) {
             set_notice("Port " + std::to_string(port + 1) + " calibration cancelled.");
         } else {
             g_calibration_request = port;
+            set_notice("");  // an old notice would hide the first step's prompt
         }
     } else if (id >= ID_CLEAR_NOTCHES && id < ID_CLEAR_NOTCHES + PORT_COUNT) {
         const int port = id - ID_CLEAR_NOTCHES;

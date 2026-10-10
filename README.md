@@ -36,6 +36,10 @@ Without calibrated notches, the program takes the stick's center from the first 
 
 The program does not do rumble.
 
+### During a run
+
+The settings window is for setup only. Set everything up and close the window before you start a run, and don't open it again until the run is over. OoT's rules require one mapping and calibration for the whole run, and the settings window shows stick values the rules don't allow during a run. While it's open, Dolphin also gets a neutral controller.
+
 ## Software dead zone
 
 Sticks rarely come to rest at exactly 0, 0. With ESS on, a stick resting a unit off center reads 1, 1 or 0, -1 in game. The game ignores that, since its own dead zone is 7, but practice tools like gz show it on screen.
@@ -64,7 +68,7 @@ The settings window has two plots, each with a numbered dot per connected contro
 
 A controller's notches are rarely perfectly straight or at exactly 45 degrees. Notch calibration fixes that. Once the notches are calibrated, the program reshapes the whole stick so every notch lands exactly where a perfect controller's notch would be, with smooth transitions in between. With ESS on, a calibrated notch reads 81 straight in game, and 58 on both axes diagonally. Those are the furthest VC goes in each direction.
 
-To calibrate a port, open the settings window and click the port's Calibrate button. Then follow the prompt at the bottom of the settings window. There are 16 steps, alternating notch and neutral: Up, Neutral, Up-Right, Neutral, and so on clockwise to Up-Left, Neutral. For a notch, hold the stick in it and press A. For Neutral, let go of the stick and press A. B cancels. A green ring on the stick plot marks where the stick should go for each step. When you're done, the prompt line says the notches were calibrated and saved, and the port shows "Calibrated" with a Clear button next to it. Clear removes the calibration.
+To calibrate a port, open the settings window and click the port's Calibrate button. Then follow the prompt at the bottom of the settings window. There are 16 steps, alternating notch and neutral: Up, Neutral, Up-Right, Neutral, and so on clockwise to Up-Left, Neutral. For a notch, hold the stick in it and press A. For Neutral, let go of the stick and press A. B cancels. A notch has to point within 22.5 degrees of its own direction and be at least halfway out. Otherwise the program says it's not that notch and asks again. A green ring on the stick plot marks where the stick should go for each step. When you're done, the prompt line says the notches were calibrated and saved, and the port shows "Calibrated" with a Clear button next to it. Clear removes the calibration.
 
 All 8 neutral samples are saved, because a stick doesn't come back to exactly the same spot every time. Together they show where your stick can rest.
 

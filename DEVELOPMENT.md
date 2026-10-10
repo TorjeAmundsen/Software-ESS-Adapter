@@ -12,10 +12,10 @@ Yes, if the stick has no dead zone and no calibration in Dolphin, with one corre
 
 ## Build
 
-You need CMake 3.20+, Ninja, and a C++17 compiler on PATH. Either works:
+You need CMake 3.20+, Ninja, and a C++17 compiler. Either works:
 
-- **MinGW-w64 g++**, for example from [MSYS2](https://www.msys2.org/) (`C:\msys64\mingw64\bin` on PATH).
-- **MSVC cl**, from a Visual Studio developer prompt.
+- **MSVC**, from Visual Studio with the "Desktop development with C++" workload. `build.ps1` finds it on its own, no developer prompt needed. Releases are built with MSVC, so it's preferred when both are installed.
+- **MinGW-w64 g++** 9 or newer, for example from [MSYS2](https://www.msys2.org/) (`C:\msys64\mingw64\bin` on PATH).
 
 ```
 .\build.ps1

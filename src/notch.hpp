@@ -42,6 +42,16 @@ struct NotchCalibration {
     int8_t notch[NOTCH_COUNT][2] = {};             // measured notch positions, offsets from neutral
 };
 
+// A notch only counts if it lies in its own section of the stick: less than 22.5 degrees from its
+// direction, so it can't cross into a neighbor's section, and at least NOTCH_MIN_DISTANCE from
+// neutral. That keeps the notches in clockwise order, so the warp can't fold the stick over itself.
+// x and y are offsets from neutral.
+constexpr int NOTCH_MIN_DISTANCE = GATE_STRAIGHT / 2;
+bool notch_in_section(int notch, int x, int y);
+
+// The first notch outside its section, or -1 if every notch is in place.
+int misplaced_notch(const NotchCalibration& calibration);
+
 // Builds a calibration from raw stick samples, one per step in the order above.
 NotchCalibration make_calibration(const uint8_t samples[CALIBRATION_STEPS][2]);
 

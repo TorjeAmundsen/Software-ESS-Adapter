@@ -40,6 +40,24 @@ bool in_neutral_range(const NotchCalibration& calibration, const uint8_t raw_sti
     return true;
 }
 
+bool notch_in_section(int notch, int x, int y) {
+    if (x * x + y * y < NOTCH_MIN_DISTANCE * NOTCH_MIN_DISTANCE) {
+        return false;
+    }
+    const double pi = 3.14159265358979323846;
+    const double ideal = std::atan2(IDEAL_NOTCHES[notch][1], IDEAL_NOTCHES[notch][0]);
+    return std::fabs(std::remainder(std::atan2(y, x) - ideal, 2 * pi)) < pi / NOTCH_COUNT;
+}
+
+int misplaced_notch(const NotchCalibration& calibration) {
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        if (!notch_in_section(i, calibration.notch[i][0], calibration.notch[i][1])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 NotchCalibration make_calibration(const uint8_t samples[CALIBRATION_STEPS][2]) {
     NotchCalibration calibration;
     uint8_t neutral_samples[NOTCH_COUNT][2];

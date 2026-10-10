@@ -1,14 +1,35 @@
-# Builds "Software ESS Adapter.exe" with the C++ toolchain on PATH and packs what end users need
-# into dist/software-ess-adapter.zip. Needs CMake, Ninja, and either MSVC cl (from a Visual Studio
-# developer prompt) or MinGW-w64 g++ on PATH. cl wins if both are there.
+# Builds "Software ESS Adapter.exe" and packs what end users need into
+# dist/software-ess-adapter.zip. Needs CMake, Ninja, and either Visual Studio with the C++ workload
+# or MinGW-w64 g++ on PATH. MSVC wins if both are there, since releases are built with it too.
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+
+# Outside a developer prompt, find Visual Studio and load its x64 build environment.
+if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    $vs = if (Test-Path $vswhere) {
+        & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    }
+    if ($vs) {
+        $env:PATH = "$(Split-Path $vswhere);$env:PATH"  # VS's own setup script calls vswhere too
+        Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+        Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+    }
+}
 
 # One build folder per compiler, so switching between them never trips over a cached compiler.
 if (Get-Command cl -ErrorAction SilentlyContinue) {
     $build = "build/msvc"
     $compilers = "-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl"
 } else {
+    # Old MinGW.org (GCC 6, 32-bit) has no C++17 or std::thread and fails deep in the build.
+    $gxx = Get-Command g++ -ErrorAction SilentlyContinue
+    $version = if ($gxx) { [int]((& g++ -dumpversion) -split "\.")[0] } else { 0 }
+    $machine = if ($gxx) { & g++ -dumpmachine } else { "" }
+    if ($version -lt 9 -or $machine -notlike "x86_64-*") {
+        $found = if ($gxx) { "$($gxx.Source) is GCC $version for $machine." } else { "No g++ found on PATH." }
+        Write-Error "$found Needs MSVC cl or 64-bit MinGW-w64 GCC 9 or newer, such as MSYS2's C:\msys64\mingw64\bin, first on PATH."
+    }
     $build = "build/mingw"
     $compilers = "-DCMAKE_C_COMPILER=gcc", "-DCMAKE_CXX_COMPILER=g++"
 }

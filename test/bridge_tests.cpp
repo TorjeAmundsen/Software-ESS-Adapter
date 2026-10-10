@@ -96,6 +96,30 @@ static void test_make_calibration() {
     CHECK(!in_neutral_range(NotchCalibration{}, inside));  // without calibrated notches there is no range
 }
 
+static void test_notch_sections() {
+    // Each notch has to be within 22.5 degrees of its own direction and far enough from neutral.
+    CHECK(notch_in_section(0, 0, 105));    // Up
+    CHECK(notch_in_section(0, 40, 100));   // Up, 21.8 degrees toward Up-Right
+    CHECK(!notch_in_section(0, 45, 100));  // 24.2 degrees: Up-Right's section
+    CHECK(!notch_in_section(0, 0, -105));  // Down
+    CHECK(!notch_in_section(0, 0, 40));    // too close to neutral
+    CHECK(notch_in_section(4, 0, -105));   // Down
+    CHECK(notch_in_section(6, -105, -5));  // Left, either side of the wraparound
+    CHECK(notch_in_section(6, -105, 5));
+    CHECK(notch_in_section(5, -60, -90));  // Down-Left, 11.3 degrees toward Down
+
+    NotchCalibration cal;
+    cal.valid = true;
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        cal.notch[i][0] = static_cast<int8_t>(IDEAL_NOTCHES[i][0] * 9 / 10);
+        cal.notch[i][1] = static_cast<int8_t>(IDEAL_NOTCHES[i][1] * 9 / 10);
+    }
+    CHECK(misplaced_notch(cal) == -1);
+    // Up-Left and Up-Right swapped.
+    std::swap(cal.notch[1][0], cal.notch[7][0]);
+    CHECK(misplaced_notch(cal) == 1);
+}
+
 static void test_notch_warp_and_snap() {
     // Notches that are off: every notch at 90% of ideal distance and rotated 5 degrees.
     NotchCalibration cal;
@@ -447,6 +471,7 @@ int main() {
     test_dolphin_round_trip();
     test_ess_center();
     test_make_calibration();
+    test_notch_sections();
     test_notch_warp_and_snap();
     test_vc_and_conversion();
     test_ess_range();
