@@ -470,9 +470,9 @@ static void test_dsu_server() {
 }
 
 static void test_axes_monotonic() {
-    // Speedrun rule: with one input axis held, raising the other axis's input must never move that
-    // axis's output closer to center. Checked with the defaults, which the ESS map alone breaks
-    // near the diagonals, and with notches rotated 5 degrees, which the warp alone breaks.
+    // Speedrun rule: with one input axis held, moving the other axis's input one way must never move
+    // that axis's in-game value the other way. Checked with the defaults, ESS range 9 to 40 and
+    // ESS range 3 to 26, which the ESS map alone breaks, and with notches rotated 5 degrees.
     NotchCalibration rotated;
     const double turn = 5 * 3.14159265358979 / 180;
     for (int i = 0; i < NOTCH_COUNT; ++i) {
@@ -481,28 +481,37 @@ static void test_axes_monotonic() {
         rotated.notch[i][1] = static_cast<int8_t>(std::lround(x * std::sin(turn) + y * std::cos(turn)));
     }
     rotated.valid = true;
-    StickSettings settings;
-    settings.dead_zone_distance = physical_dead_zone(DEAD_ZONE_DEFAULT);
-    for (const NotchCalibration& cal : {NotchCalibration{}, rotated}) {
+    StickSettings defaults;
+    defaults.dead_zone_distance = physical_dead_zone(DEAD_ZONE_DEFAULT);
+    StickSettings wide = defaults;
+    wide.range_end = physical_end(40);
+    StickSettings low_start = defaults;
+    low_start.range_start = physical_start(3);
+    const std::pair<NotchCalibration, StickSettings> cases[] = {
+        {NotchCalibration{}, defaults}, {NotchCalibration{}, wide}, {NotchCalibration{}, low_start}, {rotated, defaults}};
+    for (const auto& [cal, settings] : cases) {
         bool ok = true;
         for (int axis = 0; axis < 2 && ok; ++axis) {
             for (int held = -105; held <= 105 && ok; ++held) {
-                for (const int direction : {1, -1}) {
-                    int previous = 0;
-                    for (int moved = 0; moved <= 105; ++moved) {
-                        uint8_t s[2];
-                        s[1 - axis] = static_cast<uint8_t>(128 + held);
-                        s[axis] = static_cast<uint8_t>(128 + direction * moved);
-                        process_stick(s, cal, settings);
-                        const int out = std::abs(s[axis] - 128);
-                        if (out < previous) {
-                            std::printf("axis %d at %d (other held at %d) dropped to %d after %d\n", axis, direction * moved, held, out,
-                                        previous);
-                            ok = false;
-                            break;
-                        }
-                        previous = out;
+                int previous = -128;
+                for (int moved = -105; moved <= 105; ++moved) {
+                    uint8_t s[2];
+                    s[1 - axis] = static_cast<uint8_t>(128 + held);
+                    s[axis] = static_cast<uint8_t>(128 + moved);
+                    process_stick(s, cal, settings);
+                    int game[2];
+                    vc_in_game(s[0] - 128, s[1] - 128, game);
+                    if (!cal.valid && game[axis] * moved < 0) {  // never the other way than the stick
+                        std::printf("axis %d at %d (other held at %d) points the other way: %d\n", axis, moved, held, game[axis]);
+                        ok = false;
+                        break;
                     }
+                    if (game[axis] < previous) {
+                        std::printf("axis %d at %d (other held at %d) went back to %d after %d\n", axis, moved, held, game[axis], previous);
+                        ok = false;
+                        break;
+                    }
+                    previous = game[axis];
                 }
             }
         }
