@@ -319,6 +319,10 @@ static void test_ess_range() {
     // The dead zone runs after the ESS range and is scaled with it. Two properties for each range
     // start: at its largest (range start - 1) it zeroes everything that would read 1 to 7 in game
     // and none of ESS; and with the default range, N = 2 zeroes everything that reads 2 or less.
+    // Range start 3 puts the dead zone's edge 4 stick units from center, where the ESS range's
+    // rounding moves a stick in and out of the dead zone as one axis rises. Keeping each axis from
+    // dropping (step 5 of process_stick) then lets a few spots at the edge read up to 7 in game,
+    // which is still OoT's own dead zone, so it only checks that ESS is untouched there.
     auto pipeline = [](int x, int y, int start, int end, int dead_zone, int game[2]) {
         uint8_t s[2] = {static_cast<uint8_t>(128 + x), static_cast<uint8_t>(128 + y)};
         StickSettings settings;
@@ -337,7 +341,7 @@ static void test_ess_range() {
                 int game[2];
                 pipeline(x, y, start, end, largest, game);
                 const bool game_dead_zone = std::abs(game[0]) <= 7 && std::abs(game[1]) <= 7;
-                ok = ok && (!game_dead_zone || (game[0] == 0 && game[1] == 0));
+                ok = ok && (range_start == 3 || !game_dead_zone || (game[0] == 0 && game[1] == 0));
             }
         }
         int first_ess[2];
@@ -465,6 +469,56 @@ static void test_dsu_server() {
     server.stop();
 }
 
+static void test_axes_monotonic() {
+    // Speedrun rule: with one input axis held, moving the other axis's input one way must never move
+    // that axis's in-game value the other way. Checked with the defaults, ESS range 9 to 40 and
+    // ESS range 3 to 26, which the ESS map alone breaks, and with notches rotated 5 degrees.
+    NotchCalibration rotated;
+    const double turn = 5 * 3.14159265358979 / 180;
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        const double x = IDEAL_NOTCHES[i][0] * 0.95, y = IDEAL_NOTCHES[i][1] * 0.95;
+        rotated.notch[i][0] = static_cast<int8_t>(std::lround(x * std::cos(turn) - y * std::sin(turn)));
+        rotated.notch[i][1] = static_cast<int8_t>(std::lround(x * std::sin(turn) + y * std::cos(turn)));
+    }
+    rotated.valid = true;
+    StickSettings defaults;
+    defaults.dead_zone_distance = physical_dead_zone(DEAD_ZONE_DEFAULT);
+    StickSettings wide = defaults;
+    wide.range_end = physical_end(40);
+    StickSettings low_start = defaults;
+    low_start.range_start = physical_start(3);
+    const std::pair<NotchCalibration, StickSettings> cases[] = {
+        {NotchCalibration{}, defaults}, {NotchCalibration{}, wide}, {NotchCalibration{}, low_start}, {rotated, defaults}};
+    for (const auto& [cal, settings] : cases) {
+        bool ok = true;
+        for (int axis = 0; axis < 2 && ok; ++axis) {
+            for (int held = -105; held <= 105 && ok; ++held) {
+                int previous = -128;
+                for (int moved = -105; moved <= 105; ++moved) {
+                    uint8_t s[2];
+                    s[1 - axis] = static_cast<uint8_t>(128 + held);
+                    s[axis] = static_cast<uint8_t>(128 + moved);
+                    process_stick(s, cal, settings);
+                    int game[2];
+                    vc_in_game(s[0] - 128, s[1] - 128, game);
+                    if (!cal.valid && game[axis] * moved < 0) {  // never the other way than the stick
+                        std::printf("axis %d at %d (other held at %d) points the other way: %d\n", axis, moved, held, game[axis]);
+                        ok = false;
+                        break;
+                    }
+                    if (game[axis] < previous) {
+                        std::printf("axis %d at %d (other held at %d) went back to %d after %d\n", axis, moved, held, game[axis], previous);
+                        ok = false;
+                        break;
+                    }
+                    previous = game[axis];
+                }
+            }
+        }
+        CHECK(ok);
+    }
+}
+
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -475,6 +529,7 @@ int main() {
     test_notch_warp_and_snap();
     test_vc_and_conversion();
     test_ess_range();
+    test_axes_monotonic();
     test_dsu_server();
     WSACleanup();
     std::printf(failures ? "%d FAILED\n" : "all passed\n", failures);

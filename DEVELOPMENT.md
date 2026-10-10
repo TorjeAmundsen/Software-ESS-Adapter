@@ -43,7 +43,7 @@ You need CMake 3.20+, Ninja, and a C++17 compiler. Either works:
 .\build.ps1
 ```
 
-This builds the program in `build/msvc` or `build/mingw`, depending on the compiler (a separate folder each, so switching compilers just works), and writes `dist/software-ess-adapter.zip` with the exe and the Dolphin profile. The exe has the C++ runtime built in, so it only needs DLLs that come with Windows.
+This builds the program in `build/msvc` or `build/mingw`, depending on the compiler (a separate folder each, so switching compilers just works), and writes `dist/software-ess-adapter.zip` with the exe and the Dolphin profile. `.\build.ps1 --output <name>` writes `dist/<name>.zip` instead. The exe has the C++ runtime built in, so it only needs DLLs that come with Windows.
 
 To run the tests:
 
@@ -84,7 +84,7 @@ The style is in `.clang-format`: 4-space indents, 140-column lines, and braces o
 - `src/gc_adapter.cpp` reads the adapter with libusb, using the same protocol as Dolphin's `GCAdapter.cpp`.
 - `src/dsu_server.cpp` is the UDP server, with packet layouts from Dolphin's `DualShockUDPProto.h`.
 - `src/ess_range.cpp` has the ESS range remap, the software dead zone, the Wii VC stick mapping (ported from `generate-map.py` in ESS-Adapter), and OoT's dead zone and ESS rules (`PadUtils_UpdateRelXY` and `Player_CalcSpeedAndYawFromControlStick` in the OoT decomp).
-- `src/stick.cpp` has `process_stick`: the main stick's path from the centered stick to what goes to Dolphin (notch warp, snapping, ESS range, software dead zone, ESS map). The bridge loop and the tests both call it.
+- `src/stick.cpp` has `process_stick`: the main stick's path from the centered stick to what goes to Dolphin (notch warp, snapping, ESS range, software dead zone, ESS map, then a pass that keeps each axis's in-game value, after Wii VC, from ever moving the opposite way to its own input, as the speedrun rules require). That pass is worked out for every stick position at once, into a table per settings and calibration, which takes a few milliseconds the first time each combination is used. The bridge loop and the tests both call it.
 - `src/notch.cpp` has notch calibration, the notch warp, and snapping. The warp splits the stick into 8 slices between neighboring notches and the center, and maps each slice linearly so its two calibrated notches land on the ideal ones.
 - `src/main.cpp` has the windows, calibration, the settings file, and the bridge loop: read the adapter, center each stick, `process_stick`, send to Dolphin.
 - `src/resource.h` has the resource ids shared by `assets/resources.rc` and the code.

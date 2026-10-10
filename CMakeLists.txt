@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The version (semver), optionally with a prerelease suffix like -alpha or -beta.1. Release tags are
 # "v" plus this, e.g. v0.1.0-alpha. project() only takes the numeric part.
-set(APP_VERSION "0.1.0-alpha")
+set(APP_VERSION "0.1.1-alpha")
 string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" APP_VERSION_NUMBER "${APP_VERSION}")
 project(SoftwareESSAdapter VERSION ${APP_VERSION_NUMBER} LANGUAGES C CXX)
 

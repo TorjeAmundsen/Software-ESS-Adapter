@@ -1,8 +1,19 @@
 # Builds "Software ESS Adapter.exe" and packs what end users need into
 # dist/software-ess-adapter.zip. Needs CMake, Ninja, and either Visual Studio with the C++ workload
 # or MinGW-w64 g++ on PATH. MSVC wins if both are there, since releases are built with it too.
+#
+# --output <name> names the zip instead: .\build.ps1 --output demo writes dist/demo.zip.
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+
+$zip_name = "software-ess-adapter"
+for ($i = 0; $i -lt $args.Count; $i++) {
+    if ($args[$i] -eq "--output" -and $i + 1 -lt $args.Count) {
+        $zip_name = $args[++$i] -replace "\.zip$", ""
+    } else {
+        Write-Error "Unknown argument '$($args[$i])'. Usage: .\build.ps1 [--output <zip name>]"
+    }
+}
 
 # Outside a developer prompt, find Visual Studio and load its x64 build environment.
 if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
@@ -47,5 +58,5 @@ Copy-Item "$build/Software ESS Adapter.exe" $stage  # license texts are built in
 Copy-Item "dolphin/Software ESS Adapter.ini" "$stage/dolphin"
 
 New-Item dist -ItemType Directory -Force | Out-Null
-Compress-Archive "$stage/*" dist/software-ess-adapter.zip -Force
-Write-Host "Built $PSScriptRoot\dist\software-ess-adapter.zip ($build)"
+Compress-Archive "$stage/*" "dist/$zip_name.zip" -Force
+Write-Host "Built $PSScriptRoot\dist\$zip_name.zip ($build)"
