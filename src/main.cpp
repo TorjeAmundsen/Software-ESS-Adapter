@@ -72,12 +72,21 @@ enum ControlId {
     ID_ABOUT_LICENSES,
     ID_ABOUT_CLOSE,
     ID_RANGE_HINT,
+    ID_OFFSETS_HINT,
+    ID_OFFSETS_PROMPT,
+    ID_OFFSETS_RESET,
+    ID_OFFSETS_DONE,
     ID_ESS_CHECK = 200,
     ID_CALIBRATE = 300,
     ID_PORT_TEXT = 400,
     ID_NOTCH_TEXT = 500,
     ID_MAIN_PORT = 600,
-    ID_CLEAR_NOTCHES = 700
+    ID_CLEAR_NOTCHES = 700,
+    ID_NOTCH_OFFSETS = 800,  // per port, opens the notch offsets window
+    ID_OFFSET_STEP = 900,    // + 4 * notch + 2 * axis, + 1 for plus
+    ID_OFFSET_VALUE = 940,   // + 2 * notch + axis
+    ID_OFFSET_NAME = 960,    // + notch, then the X and Y headers
+    ID_OFFSET_GAME = 970     // + notch
 };
 
 static const COLORREF COLOR_BG = RGB(32, 32, 32);
@@ -117,6 +126,7 @@ static constexpr int LEGEND_HEIGHT = 62;                                      //
 static const int SETTINGS_BOTTOM_Y = STICK_PLOT.bottom + LEGEND_HEIGHT + 23;  // the prompt line and Done
 static const char* const SETTINGS_CLASS = "SoftwareESSAdapterSettings";
 static const char* const ABOUT_CLASS = "SoftwareESSAdapterAbout";
+static const char* const OFFSETS_CLASS = "SoftwareESSAdapterOffsets";
 static const char* const SOURCE_URL = "https://github.com/TorjeAmundsen/Software-ESS-Adapter";
 
 static DsuServer g_dsu;
@@ -161,6 +171,9 @@ static std::atomic<int> g_calibrating_port{-1};  // -1 when not calibrating
 static std::atomic<bool> g_editing{false};
 static HWND g_settings_window = nullptr;
 static HWND g_about_window = nullptr;
+// Notch offsets window, owned by the settings window so it only exists while editing.
+static HWND g_offsets_window = nullptr;
+static int g_offsets_port = 0;
 static std::atomic<int> g_calibration_step{0};  // 0 to CALIBRATION_STEPS - 1, see notch.hpp
 
 static std::mutex g_mutex;  // guards the six below
@@ -171,6 +184,8 @@ static AdapterFrame g_out{};
 static std::string g_adapter_status = "Starting";
 static std::string g_notice;  // shown in the settings window's prompt line for a few seconds
 static std::chrono::steady_clock::time_point g_notice_time;
+static std::string g_offsets_notice;  // the same for the notch offsets window
+static std::chrono::steady_clock::time_point g_offsets_notice_time;
 static NotchCalibration g_notches[PORT_COUNT];
 
 static HBRUSH g_bg_brush;
@@ -217,6 +232,7 @@ static const char* const KEY_DEAD_ZONE = "DeadZoneInGame";
 static const char* const KEY_ESS = "Ess";                 // per port
 static const char* const KEY_NEUTRAL = "NeutralSamples";  // per port
 static const char* const KEY_NOTCHES = "Notches";         // per port
+static const char* const KEY_NOTCH_OFFSETS = "NotchOffsets";  // per port
 
 // The settings rules in one place: keeps every value in its allowed range and updates the
 // distances derived from them. Runs after loading and after every change.
@@ -271,6 +287,17 @@ static void load_settings() {
             }
             calibration.valid = misplaced_notch(calibration) < 0;  // a hand-edited file could break the warp
         }
+        // NotchOffsets = x,y pairs in NOTCH_NAMES order. One a hand-edited file puts out of bounds
+        // stays 0, 0.
+        int offsets[NOTCH_COUNT * 2];
+        if (read_ints(path, port_section(p), KEY_NOTCH_OFFSETS, offsets, NOTCH_COUNT * 2, -128, 127)) {
+            for (int i = 0; i < NOTCH_COUNT; ++i) {
+                if (notch_offset_allowed(i, offsets[2 * i], offsets[2 * i + 1])) {
+                    calibration.offset[i][0] = static_cast<int8_t>(offsets[2 * i]);
+                    calibration.offset[i][1] = static_cast<int8_t>(offsets[2 * i + 1]);
+                }
+            }
+        }
         g_notches[p] = calibration;
     }
 }
@@ -283,11 +310,38 @@ static void clear_notches(int port) {
     const std::string path = settings_path();
     WritePrivateProfileStringA(port_section(port).c_str(), KEY_NEUTRAL, nullptr, path.c_str());
     WritePrivateProfileStringA(port_section(port).c_str(), KEY_NOTCHES, nullptr, path.c_str());
+    WritePrivateProfileStringA(port_section(port).c_str(), KEY_NOTCH_OFFSETS, nullptr, path.c_str());
+}
+
+// A -/+ button in the notch offsets window: which notch and axis it steps, and which way.
+struct OffsetStep {
+    int notch, axis, direction;
+};
+static OffsetStep offset_step(int id) {
+    const int step = id - ID_OFFSET_STEP;
+    return {step / 4, step / 2 % 2, step % 2 ? 1 : -1};
+}
+static bool is_offset_step(int id) {
+    return id >= ID_OFFSET_STEP && id < ID_OFFSET_STEP + NOTCH_COUNT * 4;
 }
 
 // Why a -/+ button in the settings window can't go further, or nullptr if it can. The buttons look
 // dimmed at their limit, and clicking one shows this reason instead.
 static const char* limit_reason(int id) {
+    if (is_offset_step(id)) {
+        const OffsetStep step = offset_step(id);
+        int offset[2];
+        {
+            std::lock_guard lock(g_mutex);
+            offset[0] = g_notches[g_offsets_port].offset[step.notch][0];
+            offset[1] = g_notches[g_offsets_port].offset[step.notch][1];
+        }
+        offset[step.axis] += step.direction;
+        if (!notch_offset_allowed(step.notch, offset[0], offset[1])) {
+            return "A notch offset can't move a notch past halfway to the next notch or too close to center.";
+        }
+        return nullptr;
+    }
     const int snap = g_snap_distance, start = g_range_start, end = g_range_end, dead_zone = g_dead_zone;
     switch (id) {
     case ID_SNAP_MINUS:
@@ -334,6 +388,12 @@ static void set_notice(const std::string& text) {
     g_notice_time = std::chrono::steady_clock::now();
 }
 
+static void set_offsets_notice(const std::string& text) {
+    std::lock_guard lock(g_mutex);
+    g_offsets_notice = text;
+    g_offsets_notice_time = std::chrono::steady_clock::now();
+}
+
 // "x,y,x,y,..." for NOTCH_COUNT pairs.
 template <typename T>
 static std::string join_pairs(const T (&pairs)[NOTCH_COUNT][2]) {
@@ -342,6 +402,16 @@ static std::string join_pairs(const T (&pairs)[NOTCH_COUNT][2]) {
         text += (i > 0 ? "," : "") + std::to_string(pairs[i][0]) + "," + std::to_string(pairs[i][1]);
     }
     return text;
+}
+
+static void save_notch_offsets(int port) {
+    NotchCalibration calibration;
+    {
+        std::lock_guard lock(g_mutex);
+        calibration = g_notches[port];
+    }
+    WritePrivateProfileStringA(port_section(port).c_str(), KEY_NOTCH_OFFSETS, join_pairs(calibration.offset).c_str(),
+                               settings_path().c_str());
 }
 
 static void save_notches(int port, const NotchCalibration& calibration) {
@@ -353,6 +423,18 @@ static void save_notches(int port, const NotchCalibration& calibration) {
 static void set_adapter_status(const std::string& status) {
     std::lock_guard lock(g_mutex);
     g_adapter_status = status;
+}
+
+// The stick settings for a port, as they are right now.
+static StickSettings stick_settings(int port) {
+    const RangeDistances range = range_distances();
+    StickSettings settings;
+    settings.ess = g_ess[port];
+    settings.snap_distance = g_snap_distance;
+    settings.range_start = range.start;
+    settings.range_end = range.end;
+    settings.dead_zone_distance = g_dead_zone_distance;
+    return settings;
 }
 
 static GCPortState center(const GCPortState& raw, const GCPortState& origin) {
@@ -425,12 +507,6 @@ static void bridge_loop() {
             std::lock_guard lock(g_mutex);
             std::copy(std::begin(g_notches), std::end(g_notches), notches);
         }
-        const RangeDistances range = range_distances();
-        StickSettings stick_settings;
-        stick_settings.snap_distance = g_snap_distance;
-        stick_settings.range_start = range.start;
-        stick_settings.range_end = range.end;
-        stick_settings.dead_zone_distance = g_dead_zone_distance;
 
         for (int p = 0; p < PORT_COUNT; ++p) {
             // Like Dolphin and the console: the first report after plugging in is the origin.
@@ -481,8 +557,12 @@ static void bridge_loop() {
                     } else {
                         save_notches(p, calibration);
                         {
+                            // Calibrating again keeps the notch offsets.
                             std::lock_guard lock(g_mutex);
-                            g_notches[p] = calibration;
+                            NotchCalibration with_offsets = calibration;
+                            std::copy(&g_notches[p].offset[0][0], &g_notches[p].offset[0][0] + NOTCH_COUNT * 2,
+                                      &with_offsets.offset[0][0]);
+                            g_notches[p] = with_offsets;
                         }
                         g_calibrating_port = -1;
                         set_notice("Port " + std::to_string(p + 1) + " notches calibrated and saved.");
@@ -492,9 +572,7 @@ static void bridge_loop() {
 
             out[p] = centered[p];
             calibrated[p] = centered[p];
-            StickSettings settings = stick_settings;
-            settings.ess = g_ess[p];
-            process_stick(out[p].stick, notches[p], settings, calibrated[p].stick);
+            process_stick(out[p].stick, notches[p], stick_settings(p), calibrated[p].stick);
 
             // Calibration only happens while editing, so this also covers it.
             sent[p] = out[p];
@@ -612,11 +690,14 @@ static void refresh_settings(HWND hwnd) {
             text = buffer;
         }
         set_text(hwnd, ID_PORT_TEXT + p, text);
-        set_text(hwnd, ID_NOTCH_TEXT + p, calibrated[p] ? "Calibrated" : "Not calibrated");
-        HWND clear = GetDlgItem(hwnd, ID_CLEAR_NOTCHES + p);
-        const bool show_clear = calibrated[p] && calibrating != p;
-        if ((IsWindowVisible(clear) != FALSE) != show_clear) {
-            ShowWindow(clear, show_clear ? SW_SHOW : SW_HIDE);
+        // A calibrated port shows Notch offsets and Clear in place of the text.
+        set_text(hwnd, ID_NOTCH_TEXT + p, calibrated[p] ? "" : "Not calibrated");
+        const bool show_buttons = calibrated[p] && calibrating != p;
+        for (const int id : {ID_NOTCH_OFFSETS + p, ID_CLEAR_NOTCHES + p}) {
+            HWND button = GetDlgItem(hwnd, id);
+            if ((IsWindowVisible(button) != FALSE) != show_buttons) {
+                ShowWindow(button, show_buttons ? SW_SHOW : SW_HIDE);
+            }
         }
         set_text(hwnd, ID_CALIBRATE + p, calibrating == p ? "Cancel" : "Calibrate");
     }
@@ -932,6 +1013,8 @@ static HWND create_fixed_window(const char* cls, const char* title, DWORD style,
                          GetModuleHandleA(nullptr), nullptr);
 }
 
+static void open_offsets(HWND owner, int port);
+
 static void on_settings_command(HWND hwnd, int id) {
     if (id == ID_DONE || id == IDCANCEL) {  // IDCANCEL: Escape
         DestroyWindow(hwnd);
@@ -967,15 +1050,20 @@ static void on_settings_command(HWND hwnd, int id) {
         }
     } else if (id >= ID_CLEAR_NOTCHES && id < ID_CLEAR_NOTCHES + PORT_COUNT) {
         const int port = id - ID_CLEAR_NOTCHES;
-        const std::string question = "Clear the notch calibration for port " + std::to_string(port + 1) + "?";
+        const std::string question = "Clear the notch calibration and notch offsets for port " + std::to_string(port + 1) + "?";
         if (MessageBoxA(hwnd, question.c_str(), "Software ESS Adapter", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            if (g_offsets_window && g_offsets_port == port) {
+                DestroyWindow(g_offsets_window);
+            }
             {
                 std::lock_guard lock(g_mutex);
                 g_notches[port] = NotchCalibration{};
             }
             clear_notches(port);
-            set_notice("Port " + std::to_string(port + 1) + " notch calibration cleared.");
+            set_notice("Port " + std::to_string(port + 1) + " notch calibration and notch offsets cleared.");
         }
+    } else if (id >= ID_NOTCH_OFFSETS && id < ID_NOTCH_OFFSETS + PORT_COUNT) {
+        open_offsets(hwnd, id - ID_NOTCH_OFFSETS);
     } else if (id == ID_RANGE_DEFAULT) {
         g_range_start = ESS_IN_GAME_START;
         g_range_end = ESS_IN_GAME_END;
@@ -1024,11 +1112,11 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
             const std::string label = "Port " + std::to_string(p + 1) + " ESS";
             add_control(hwnd, "BUTTON", label.c_str(), BS_OWNERDRAW, 10, y, 85, 22, ID_ESS_CHECK + p);
             add_control(hwnd, "BUTTON", "Calibrate", BS_OWNERDRAW, 100, y, 75, 22, ID_CALIBRATE + p);
-            HWND readout = add_control(hwnd, "STATIC", "", 0, 185, y + 3, 240, 18, ID_PORT_TEXT + p);
+            HWND readout = add_control(hwnd, "STATIC", "", 0, 185, y + 3, 212, 18, ID_PORT_TEXT + p);
             SendMessageA(readout, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
-            add_control(hwnd, "STATIC", "", 0, 432, y + 3, 100, 18, ID_NOTCH_TEXT + p);
-            HWND clear = add_control(hwnd, "BUTTON", "Clear", BS_OWNERDRAW, 494, y, 44, 22, ID_CLEAR_NOTCHES + p);
-            ShowWindow(clear, SW_HIDE);
+            add_control(hwnd, "STATIC", "", 0, 404, y + 3, 134, 18, ID_NOTCH_TEXT + p);
+            ShowWindow(add_control(hwnd, "BUTTON", "Notch offsets", BS_OWNERDRAW, 404, y, 86, 22, ID_NOTCH_OFFSETS + p), SW_HIDE);
+            ShowWindow(add_control(hwnd, "BUTTON", "Clear", BS_OWNERDRAW, 494, y, 44, 22, ID_CLEAR_NOTCHES + p), SW_HIDE);
         }
         {
             // Settings as a table: label, -/+ controls, short hint. Every row's controls start at
@@ -1080,6 +1168,172 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+// Notch offsets window: an offset per notch, each axis with -/+ buttons, and where holding
+// that notch lands in game with everything else applied.
+static const int OFFSETS_ROW_Y = 70, OFFSETS_ROW_HEIGHT = 28;
+static const int OFFSETS_BOTTOM_Y = OFFSETS_ROW_Y + NOTCH_COUNT * OFFSETS_ROW_HEIGHT + 4;  // the prompt line, then the buttons
+
+static void refresh_offsets(HWND hwnd) {
+    const int port = g_offsets_port;
+    NotchCalibration calibration;
+    std::string notice;
+    {
+        std::lock_guard lock(g_mutex);
+        calibration = g_notches[port];
+        if (std::chrono::steady_clock::now() - g_offsets_notice_time < std::chrono::seconds(4)) {
+            notice = g_offsets_notice;
+        }
+    }
+    const StickSettings settings = stick_settings(port);
+    // With ESS on, the ESS map gives the same in-game value for neighboring sticks, so a click
+    // doesn't always change Game.
+    if (notice.empty() && settings.ess) {
+        notice = "With ESS on, some steps don't change Game.";
+    }
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        for (int axis = 0; axis < 2; ++axis) {
+            set_text(hwnd, ID_OFFSET_VALUE + 2 * i + axis, std::to_string(calibration.offset[i][axis]));
+        }
+        // The calibrated notch, centered on neutral as the bridge loop does it, through the
+        // whole stick path.
+        uint8_t stick[2] = {static_cast<uint8_t>(128 + calibration.notch[i][0]), static_cast<uint8_t>(128 + calibration.notch[i][1])};
+        process_stick(stick, calibration, settings);
+        int in_game[2];
+        vc_in_game(stick[0] - 128, stick[1] - 128, in_game);
+        char buffer[32];
+        std::snprintf(buffer, sizeof(buffer), "Game %3d,%3d", in_game[0], in_game[1]);
+        set_text(hwnd, ID_OFFSET_GAME + i, buffer);
+    }
+    // Repaint a -/+ button when it reaches or leaves its limit (it looks dimmed there).
+    static bool shown_at_limit[NOTCH_COUNT * 4] = {};
+    for (int step = 0; step < NOTCH_COUNT * 4; ++step) {
+        const bool at_limit = limit_reason(ID_OFFSET_STEP + step) != nullptr;
+        if (at_limit != shown_at_limit[step]) {
+            shown_at_limit[step] = at_limit;
+            InvalidateRect(GetDlgItem(hwnd, ID_OFFSET_STEP + step), nullptr, TRUE);
+        }
+    }
+    set_text(hwnd, ID_OFFSETS_PROMPT, notice);
+}
+
+static void on_offsets_command(HWND hwnd, int id) {
+    if (id == ID_OFFSETS_DONE || id == IDCANCEL) {  // IDCANCEL: Escape
+        DestroyWindow(hwnd);
+        return;
+    }
+    if (const char* reason = limit_reason(id)) {
+        set_offsets_notice(reason);
+        refresh_offsets(hwnd);
+        return;
+    }
+    const int port = g_offsets_port;
+    if (is_offset_step(id)) {
+        const OffsetStep step = offset_step(id);
+        std::lock_guard lock(g_mutex);
+        g_notches[port].offset[step.notch][step.axis] += step.direction;
+    } else if (id == ID_OFFSETS_RESET) {
+        // Ask first, like Clear.
+        bool any = false;
+        {
+            std::lock_guard lock(g_mutex);
+            for (const auto& offset : g_notches[port].offset) {
+                any = any || offset[0] != 0 || offset[1] != 0;
+            }
+        }
+        if (!any) {
+            set_offsets_notice("Every notch offset is already 0.");
+            refresh_offsets(hwnd);
+            return;
+        }
+        const std::string question = "Reset every notch offset for port " + std::to_string(port + 1) + " to 0?";
+        if (MessageBoxA(hwnd, question.c_str(), "Software ESS Adapter", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+            return;
+        }
+        std::lock_guard lock(g_mutex);
+        std::fill(&g_notches[port].offset[0][0], &g_notches[port].offset[0][0] + NOTCH_COUNT * 2, 0);
+    } else {
+        return;
+    }
+    save_notch_offsets(port);
+    refresh_offsets(hwnd);
+}
+
+static LRESULT CALLBACK offsets_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    LRESULT result;
+    if (handle_dark_controls(msg, wparam, lparam, result)) {
+        return result;
+    }
+
+    switch (msg) {
+    case WM_CREATE: {
+        use_dark_title_bar(hwnd);
+        add_dim_text(hwnd, "Move where each calibrated notch lands, in stick units. Game shows what OoT reads when you hold it.", 10,
+                     10, 380, 34, ID_OFFSETS_HINT);
+        const int x_column = 90, y_column = 186, game_column = 284;
+        add_control(hwnd, "STATIC", "X", SS_CENTER, x_column, OFFSETS_ROW_Y - 20, 82, 18, ID_OFFSET_NAME + NOTCH_COUNT);
+        add_control(hwnd, "STATIC", "Y", SS_CENTER, y_column, OFFSETS_ROW_Y - 20, 82, 18, ID_OFFSET_NAME + NOTCH_COUNT + 1);
+        for (int i = 0; i < NOTCH_COUNT; ++i) {
+            const int y = OFFSETS_ROW_Y + i * OFFSETS_ROW_HEIGHT;
+            add_control(hwnd, "STATIC", NOTCH_NAMES[i], 0, 10, y + 3, 75, 18, ID_OFFSET_NAME + i);
+            for (int axis = 0; axis < 2; ++axis) {
+                const int x = axis == 0 ? x_column : y_column;
+                const int step = ID_OFFSET_STEP + 4 * i + 2 * axis;
+                add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, x, y, 24, 22, step);
+                add_control(hwnd, "STATIC", "", SS_CENTER, x + 26, y + 3, 30, 18, ID_OFFSET_VALUE + 2 * i + axis);
+                add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, x + 58, y, 24, 22, step + 1);
+            }
+            HWND game = add_control(hwnd, "STATIC", "", 0, game_column, y + 3, 106, 18, ID_OFFSET_GAME + i);
+            SendMessageA(game, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
+        }
+        add_control(hwnd, "STATIC", "", 0, 10, OFFSETS_BOTTOM_Y, 380, 18, ID_OFFSETS_PROMPT);
+        add_control(hwnd, "BUTTON", "Reset all", BS_OWNERDRAW, 10, OFFSETS_BOTTOM_Y + 24, 90, 24, ID_OFFSETS_RESET);
+        add_control(hwnd, "BUTTON", "Done", BS_OWNERDRAW, 290, OFFSETS_BOTTOM_Y + 24, 100, 24, ID_OFFSETS_DONE);
+        refresh_offsets(hwnd);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (is_click(wparam)) {
+            on_offsets_command(hwnd, LOWORD(wparam));
+        }
+        return 0;
+    case WM_DESTROY:
+        g_offsets_window = nullptr;
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+static void open_offsets(HWND owner, int port) {
+    if (g_offsets_window && g_offsets_port == port) {
+        SetForegroundWindow(g_offsets_window);
+        return;
+    }
+    if (g_offsets_window) {
+        DestroyWindow(g_offsets_window);
+    }
+    g_offsets_port = port;
+    const std::string title = "Port " + std::to_string(port + 1) + " notch offsets";
+    g_offsets_window =
+        create_fixed_window(OFFSETS_CLASS, title.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, 400, OFFSETS_BOTTOM_Y + 58, owner);
+    // Beside the settings window, so its plots stay visible: to the right if it fits on that
+    // screen, else to the left, else where Windows put it.
+    RECT settings, own;
+    GetWindowRect(owner, &settings);
+    GetWindowRect(g_offsets_window, &own);
+    MONITORINFO monitor = {};
+    monitor.cbSize = sizeof(monitor);
+    GetMonitorInfoA(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitor);
+    const RECT& screen = monitor.rcWork;
+    const int width = own.right - own.left, height = own.bottom - own.top;
+    const int top = std::clamp<int>(settings.top, screen.top, std::max<int>(screen.top, screen.bottom - height));
+    if (settings.right + width <= screen.right) {
+        SetWindowPos(g_offsets_window, nullptr, settings.right, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    } else if (settings.left - width >= screen.left) {
+        SetWindowPos(g_offsets_window, nullptr, settings.left - width, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    ShowWindow(g_offsets_window, SW_SHOW);
 }
 
 static void open_settings(HWND owner) {
@@ -1271,6 +1525,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     wc.lpfnWndProc = about_proc;
     wc.lpszClassName = ABOUT_CLASS;
     RegisterClassExA(&wc);
+    wc.lpfnWndProc = offsets_proc;
+    wc.lpszClassName = OFFSETS_CLASS;
+    RegisterClassExA(&wc);
 
     HWND hwnd = create_fixed_window("SoftwareESSAdapter", "Software ESS Adapter", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                                     MAIN_RIGHT_X + 80, MAIN_BOTTOM_Y + 34, nullptr);
@@ -1302,6 +1559,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
             refresh_main(hwnd);
             if (g_settings_window) {
                 refresh_settings(g_settings_window);
+            }
+            if (g_offsets_window) {
+                refresh_offsets(g_offsets_window);
             }
             next_frame += period;
         }

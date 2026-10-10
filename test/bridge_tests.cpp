@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <string>
 #include <utility>
 
 #include "dsu_server.hpp"
@@ -182,6 +183,48 @@ static void test_notch_warp_and_snap() {
     // Without a calibration the warp does nothing.
     cal.valid = false;
     CHECK(warp(50, 20) == std::make_pair(50, 20));
+}
+
+static void test_notch_offsets() {
+    // A target follows the calibrated notch rule: in its own section, and it fits in a stick byte.
+    CHECK(notch_offset_allowed(3, 1, -6));
+    CHECK(notch_offset_allowed(7, 0, -27));    // Up-Left at -75,48: 12.4 degrees toward Left
+    CHECK(notch_offset_allowed(0, 43, 0));     // Up at 43,105: 22.3 degrees
+    CHECK(!notch_offset_allowed(0, 44, 0));    // 22.7 degrees: Up-Right's section
+    CHECK(!notch_offset_allowed(0, 0, -54));   // 0,51: too close to center
+    CHECK(notch_offset_allowed(0, 0, 22));     // 0,127: the edge
+    CHECK(!notch_offset_allowed(0, 0, 23));    // past it
+    CHECK(!notch_offset_allowed(1, -75, -75));  // the center itself
+
+    // Warp and snap aim at the target instead of the ideal notch.
+    NotchCalibration cal;
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        cal.notch[i][0] = static_cast<int8_t>(IDEAL_NOTCHES[i][0] * 9 / 10);
+        cal.notch[i][1] = static_cast<int8_t>(IDEAL_NOTCHES[i][1] * 9 / 10);
+    }
+    cal.valid = true;
+    cal.offset[3][0] = 1;
+    cal.offset[3][1] = -6;
+    int target[2];
+    notch_target(cal, 3, target);
+    CHECK(target[0] == 76 && target[1] == -81);
+    uint8_t s[2] = {static_cast<uint8_t>(128 + cal.notch[3][0]), static_cast<uint8_t>(128 + cal.notch[3][1])};
+    warp_to_ideal_notches(s, cal);
+    CHECK(s[0] - 128 == 76 && s[1] - 128 == -81);
+    uint8_t close[2] = {128 + 74, 128 - 80};
+    snap_to_notch(close, cal, 3);
+    CHECK(close[0] - 128 == 76 && close[1] - 128 == -81);
+    uint8_t ideal[2] = {128 + 75, 128 - 75};  // the ideal notch is no longer a snap target
+    snap_to_notch(ideal, cal, 3);
+    CHECK(ideal[0] - 128 == 75 && ideal[1] - 128 == -75);
+
+    // Holding that notch through the whole path: Down-Right 76,-81 goes in as 56,-60 with ESS on.
+    StickSettings settings;
+    uint8_t held[2] = {static_cast<uint8_t>(128 + cal.notch[3][0]), static_cast<uint8_t>(128 + cal.notch[3][1])};
+    process_stick(held, cal, settings);
+    int game[2];
+    vc_in_game(held[0] - 128, held[1] - 128, game);
+    CHECK(game[0] == 56 && game[1] == -60);
 }
 
 // Physical cardinal distance -> in-game value, through the whole pipeline, all 4 directions.
@@ -469,53 +512,169 @@ static void test_dsu_server() {
     server.stop();
 }
 
-static void test_axes_monotonic() {
-    // Speedrun rule: with one input axis held, moving the other axis's input one way must never move
-    // that axis's in-game value the other way. Checked with the defaults, ESS range 9 to 40 and
-    // ESS range 3 to 26, which the ESS map alone breaks, and with notches rotated 5 degrees.
-    NotchCalibration rotated;
-    const double turn = 5 * 3.14159265358979 / 180;
-    for (int i = 0; i < NOTCH_COUNT; ++i) {
-        const double x = IDEAL_NOTCHES[i][0] * 0.95, y = IDEAL_NOTCHES[i][1] * 0.95;
-        rotated.notch[i][0] = static_cast<int8_t>(std::lround(x * std::cos(turn) - y * std::sin(turn)));
-        rotated.notch[i][1] = static_cast<int8_t>(std::lround(x * std::sin(turn) + y * std::cos(turn)));
+// Speedrun rule: with one input axis held, moving the other axis's input one way must never move
+// that axis's in-game value the other way. Sweeps every raw stick position (0 to 255 on both
+// axes, past the gate too) and returns how many steps break that, printing the first. The center
+// has to read 0, 0, and without calibration no axis may point the other way from the stick.
+static int monotonic_breaks(const char* name, const NotchCalibration& cal, const StickSettings& settings) {
+    auto game_at = [&](int x, int y, int game[2]) {
+        uint8_t s[2] = {static_cast<uint8_t>(x), static_cast<uint8_t>(y)};
+        process_stick(s, cal, settings);
+        vc_in_game(s[0] - 128, s[1] - 128, game);
+    };
+    int breaks = 0;
+    auto report = [&](const char* what, int axis, int moved, int held, int value, int previous) {
+        if (breaks++ == 0) {
+            std::printf("%s: axis %d at %d (other held at %d) %s %d (before: %d)\n", name, axis, moved - 128, held - 128, what, value,
+                        previous);
+        }
+    };
+    int center[2];
+    game_at(128, 128, center);
+    if (center[0] != 0 || center[1] != 0) {
+        report("center reads", 0, 128, 128, center[0], center[1]);
     }
-    rotated.valid = true;
+    for (int axis = 0; axis < 2; ++axis) {
+        for (int held = 0; held < 256; ++held) {
+            int previous = -128;
+            for (int moved = 0; moved < 256; ++moved) {
+                int game[2];
+                game_at(axis == 0 ? moved : held, axis == 0 ? held : moved, game);
+                if (game[axis] < previous) {
+                    report("went back to", axis, moved, held, game[axis], previous);
+                }
+                if (!cal.valid && game[axis] * (moved - 128) < 0) {
+                    report("points the other way:", axis, moved, held, game[axis], previous);
+                }
+                previous = game[axis];
+            }
+        }
+    }
+    return breaks;
+}
+
+static NotchCalibration turned_notches(double degrees, double scale) {
+    NotchCalibration cal;
+    const double turn = degrees * 3.14159265358979 / 180;
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        const double x = IDEAL_NOTCHES[i][0] * scale, y = IDEAL_NOTCHES[i][1] * scale;
+        cal.notch[i][0] = static_cast<int8_t>(std::lround(x * std::cos(turn) - y * std::sin(turn)));
+        cal.notch[i][1] = static_cast<int8_t>(std::lround(x * std::sin(turn) + y * std::cos(turn)));
+    }
+    cal.valid = true;
+    return cal;
+}
+
+static void test_axes_monotonic() {
+    // Fixed cases: the defaults, ESS range 9 to 40 and 3 to 26, which the ESS map alone breaks,
+    // notches turned 5 degrees, and notch offsets with snapping, ESS on and off. With ESS off,
+    // snapping alone breaks it through VC's length limit, and big offsets in hundreds of places.
+    const NotchCalibration turned = turned_notches(5, 0.95);
     StickSettings defaults;
     defaults.dead_zone_distance = physical_dead_zone(DEAD_ZONE_DEFAULT);
     StickSettings wide = defaults;
     wide.range_end = physical_end(40);
     StickSettings low_start = defaults;
     low_start.range_start = physical_start(3);
-    const std::pair<NotchCalibration, StickSettings> cases[] = {
-        {NotchCalibration{}, defaults}, {NotchCalibration{}, wide}, {NotchCalibration{}, low_start}, {rotated, defaults}};
-    for (const auto& [cal, settings] : cases) {
-        bool ok = true;
-        for (int axis = 0; axis < 2 && ok; ++axis) {
-            for (int held = -105; held <= 105 && ok; ++held) {
-                int previous = -128;
-                for (int moved = -105; moved <= 105; ++moved) {
-                    uint8_t s[2];
-                    s[1 - axis] = static_cast<uint8_t>(128 + held);
-                    s[axis] = static_cast<uint8_t>(128 + moved);
-                    process_stick(s, cal, settings);
-                    int game[2];
-                    vc_in_game(s[0] - 128, s[1] - 128, game);
-                    if (!cal.valid && game[axis] * moved < 0) {  // never the other way than the stick
-                        std::printf("axis %d at %d (other held at %d) points the other way: %d\n", axis, moved, held, game[axis]);
-                        ok = false;
-                        break;
-                    }
-                    if (game[axis] < previous) {
-                        std::printf("axis %d at %d (other held at %d) went back to %d after %d\n", axis, moved, held, game[axis], previous);
-                        ok = false;
-                        break;
-                    }
-                    previous = game[axis];
-                }
+    // Targets turned 20 degrees, alternately toward each other, at 60% to 115% of the ideal
+    // distance: neighbors end up 5 degrees apart.
+    NotchCalibration offsets = turned;
+    const NotchCalibration targets[2] = {turned_notches(20, 0.6), turned_notches(-20, 1.15)};
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        const NotchCalibration& t = targets[i % 2];
+        offsets.offset[i][0] = static_cast<int8_t>(t.notch[i][0] - IDEAL_NOTCHES[i][0]);
+        offsets.offset[i][1] = static_cast<int8_t>(t.notch[i][1] - IDEAL_NOTCHES[i][1]);
+        CHECK(notch_offset_allowed(i, offsets.offset[i][0], offsets.offset[i][1]));
+    }
+    StickSettings snapping = defaults;
+    snapping.snap_distance = MAX_SNAP_DISTANCE;
+    StickSettings ess_off = snapping;
+    ess_off.ess = false;
+    // Offsets where the table used to get boxed in near VC's length limit: x had to reach -77 and
+    // y stay at 41, which VC can't do at once, so Stick -93,38 to -93,39 read y 41 then 40.
+    NotchCalibration boxed_in = turned_notches(0, 1);
+    const int boxed_in_offsets[NOTCH_COUNT][2] = {{6, -12}, {-2, 2}, {-11, -9}, {-5, -15}, {3, -6}, {14, -14}, {15, 15}, {-8, 2}};
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        boxed_in.offset[i][0] = static_cast<int8_t>(boxed_in_offsets[i][0]);
+        boxed_in.offset[i][1] = static_cast<int8_t>(boxed_in_offsets[i][1]);
+    }
+    StickSettings boxed_in_settings;
+    boxed_in_settings.snap_distance = 1;
+    boxed_in_settings.range_start = physical_start(5);
+    boxed_in_settings.range_end = physical_end(35);
+    boxed_in_settings.dead_zone_distance = physical_dead_zone(4);
+
+    const struct {
+        const char* name;
+        NotchCalibration cal;
+        StickSettings settings;
+    } cases[] = {{"defaults", NotchCalibration{}, defaults},
+                 {"ESS range 9 to 40", NotchCalibration{}, wide},
+                 {"ESS range 3 to 26", NotchCalibration{}, low_start},
+                 {"turned notches", turned, defaults},
+                 {"turned notches, ESS off, snap 5", turned, ess_off},
+                 {"big offsets, snap 5", offsets, snapping},
+                 {"big offsets, ESS off, snap 5", offsets, ess_off},
+                 {"boxed in", boxed_in, boxed_in_settings}};
+    for (const auto& c : cases) {
+        CHECK(monotonic_breaks(c.name, c.cal, c.settings) == 0);
+    }
+
+    // Random cases from a fixed seed: calibrations turned, scaled and jittered, targets anywhere in
+    // their sections, ESS on and off, any snap distance, ESS range and dead zone.
+    unsigned seed = 12345;
+    auto random = [&](int low, int high) {
+        seed = seed * 1103515245 + 12345;
+        return low + static_cast<int>((seed >> 8) % static_cast<unsigned>(high - low + 1));
+    };
+    for (int n = 0; n < 150; ++n) {
+        NotchCalibration cal;
+        if (random(0, 5) > 0) {
+            cal = turned_notches(random(-15, 15), random(80, 110) / 100.0);
+            const int most = random(0, 1) ? 60 : random(0, 30);
+            for (int i = 0; i < NOTCH_COUNT; ++i) {
+                int x, y;
+                do {
+                    x = cal.notch[i][0] + random(-6, 6);
+                    y = cal.notch[i][1] + random(-6, 6);
+                } while (!notch_in_section(i, x, y));
+                cal.notch[i][0] = static_cast<int8_t>(x);
+                cal.notch[i][1] = static_cast<int8_t>(y);
+                int dx, dy;
+                do {
+                    dx = random(-most, most);
+                    dy = random(-most, most);
+                } while (!notch_offset_allowed(i, dx, dy));
+                cal.offset[i][0] = static_cast<int8_t>(dx);
+                cal.offset[i][1] = static_cast<int8_t>(dy);
             }
         }
-        CHECK(ok);
+        StickSettings settings;
+        settings.ess = random(0, 3) > 0;
+        settings.snap_distance = random(0, MAX_SNAP_DISTANCE);
+        const int start = random(1, 15), end = random(start + 1, std::min(start + 45, max_in_game_end()));
+        settings.range_start = physical_start(start);
+        settings.range_end = std::max(physical_end(end), settings.range_start + 1);
+        settings.dead_zone_distance = physical_dead_zone(random(0, start - 1));
+        const std::string name = "random case " + std::to_string(n);
+        CHECK(monotonic_breaks(name.c_str(), cal, settings) == 0);
+    }
+
+    // With ESS off and no calibration, the pass changes nothing: only the dead zone applies.
+    for (const int dead_zone : {0, 2, 6}) {
+        StickSettings plain;
+        plain.ess = false;
+        plain.dead_zone_distance = physical_dead_zone(dead_zone);
+        bool same = true;
+        for (int x = 0; x < 256; ++x) {
+            for (int y = 0; y < 256; ++y) {
+                uint8_t s[2] = {static_cast<uint8_t>(x), static_cast<uint8_t>(y)}, expected[2] = {s[0], s[1]};
+                process_stick(s, NotchCalibration{}, plain);
+                apply_dead_zone(expected, plain.dead_zone_distance);
+                same = same && s[0] == expected[0] && s[1] == expected[1];
+            }
+        }
+        CHECK(same);
     }
 }
 
@@ -527,6 +686,7 @@ int main() {
     test_make_calibration();
     test_notch_sections();
     test_notch_warp_and_snap();
+    test_notch_offsets();
     test_vc_and_conversion();
     test_ess_range();
     test_axes_monotonic();

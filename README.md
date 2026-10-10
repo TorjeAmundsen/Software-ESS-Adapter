@@ -60,7 +60,7 @@ Notch calibration makes your notches read exactly like a perfect controller's no
 1. In the settings window, click Calibrate on your controller's port.
 2. Follow the line at the bottom of the window. For a notch, hold the stick in that notch and press A. For Neutral, let go of the stick and press A. A green ring shows where the stick should go. B cancels.
 3. If you press A outside the notch it asks for, it asks again.
-4. After 16 steps the port shows "Calibrated". Clear removes the calibration.
+4. After 16 steps the port shows Notch offsets and Clear. Clear removes the calibration and its notch offsets.
 
 <!-- Recording: a full calibration in the settings window, all 16 steps.
      GIF: keep the line below. MP4: GitHub won't play a video from the repo. Drag the file into
@@ -72,6 +72,10 @@ Calibrations belong to the adapter port, so calibrate again if you move your con
 ### Notch snapping
 
 With notch snapping on, the stick reads exactly the notch when it's within that many units of it, so notches are a bit easier to hit. It only works with calibrated notches. 0 turns it off, 5 is the most.
+
+### Notch offsets
+
+Notch offsets change where a calibrated notch lands. Click Notch offsets on the port, then use - and + to move each notch on X and Y, in stick units. A notch can move as far as a calibrated notch could be: not past halfway to the next notch, and not too close to the center. Next to each notch, Game shows what OoT reads when you hold it. For example, with ESS on, Down-Right at X 1, Y -6 reads 56, -60 instead of 58, -58. With ESS on, some clicks don't change Game, because nearby stick positions read the same in game. Reset all puts every notch back. Snapping goes to the moved spot, and calibrating again keeps your offsets.
 
 ## License
 

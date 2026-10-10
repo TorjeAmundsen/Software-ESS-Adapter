@@ -49,6 +49,16 @@ bool notch_in_section(int notch, int x, int y) {
     return std::fabs(std::remainder(std::atan2(y, x) - ideal, 2 * pi)) < pi / NOTCH_COUNT;
 }
 
+void notch_target(const NotchCalibration& calibration, int notch, int target[2]) {
+    target[0] = IDEAL_NOTCHES[notch][0] + calibration.offset[notch][0];
+    target[1] = IDEAL_NOTCHES[notch][1] + calibration.offset[notch][1];
+}
+
+bool notch_offset_allowed(int notch, int dx, int dy) {
+    const int x = IDEAL_NOTCHES[notch][0] + dx, y = IDEAL_NOTCHES[notch][1] + dy;
+    return x >= -127 && x <= 127 && y >= -127 && y <= 127 && notch_in_section(notch, x, y);
+}
+
 int misplaced_notch(const NotchCalibration& calibration) {
     for (int i = 0; i < NOTCH_COUNT; ++i) {
         if (!notch_in_section(i, calibration.notch[i][0], calibration.notch[i][1])) {
@@ -100,8 +110,11 @@ void warp_to_ideal_notches(uint8_t stick[2], const NotchCalibration& calibration
         if (a < -1e-9 || b < -1e-9) {
             continue;
         }
-        const double out_x = a * IDEAL_NOTCHES[i][0] + b * IDEAL_NOTCHES[j][0];
-        const double out_y = a * IDEAL_NOTCHES[i][1] + b * IDEAL_NOTCHES[j][1];
+        int target_i[2], target_j[2];
+        notch_target(calibration, i, target_i);
+        notch_target(calibration, j, target_j);
+        const double out_x = a * target_i[0] + b * target_j[0];
+        const double out_y = a * target_i[1] + b * target_j[1];
         auto to_byte = [](double v) {
             const long r = std::lround(v);
             return static_cast<uint8_t>((r < -128 ? -128 : r > 127 ? 127 : r) + 128);
@@ -121,18 +134,23 @@ void snap_to_notch(uint8_t stick[2], const NotchCalibration& calibration, int di
     const int y = stick[1] - 128;
     int best = -1;
     int best_dist2 = distance * distance;
+    int best_target[2] = {};
     for (int i = 0; i < NOTCH_COUNT; ++i) {
-        const int dx = x - IDEAL_NOTCHES[i][0];
-        const int dy = y - IDEAL_NOTCHES[i][1];
+        int target[2];
+        notch_target(calibration, i, target);
+        const int dx = x - target[0];
+        const int dy = y - target[1];
         const int dist2 = dx * dx + dy * dy;
         if (dist2 <= best_dist2) {
             best = i;
             best_dist2 = dist2;
+            best_target[0] = target[0];
+            best_target[1] = target[1];
         }
     }
 
     if (best >= 0) {
-        stick[0] = static_cast<uint8_t>(128 + IDEAL_NOTCHES[best][0]);
-        stick[1] = static_cast<uint8_t>(128 + IDEAL_NOTCHES[best][1]);
+        stick[0] = static_cast<uint8_t>(128 + best_target[0]);
+        stick[1] = static_cast<uint8_t>(128 + best_target[1]);
     }
 }

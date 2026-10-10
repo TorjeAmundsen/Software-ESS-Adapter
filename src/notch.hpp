@@ -40,7 +40,15 @@ struct NotchCalibration {
     uint8_t neutral_min[2] = {128, 128};           // smallest and largest sample on each axis:
     uint8_t neutral_max[2] = {128, 128};           // the range where the stick can rest
     int8_t notch[NOTCH_COUNT][2] = {};             // measured notch positions, offsets from neutral
+    int8_t offset[NOTCH_COUNT][2] = {};            // notch offsets, added to the ideal notches, see notch_target
 };
+
+// Where holding a calibrated notch lands (its target): the ideal notch moved by that notch's
+// offset, in stick units. A target follows the same rule as a calibrated notch: it has to lie in its notch's
+// own section (see notch_in_section), so the warp still can't fold the stick over itself. It also
+// has to fit in a stick byte. notch_offset_allowed checks both.
+void notch_target(const NotchCalibration& calibration, int notch, int target[2]);
+bool notch_offset_allowed(int notch, int dx, int dy);
 
 // A notch only counts if it lies in its own section of the stick: less than 22.5 degrees from its
 // direction, so it can't cross into a neighbor's section, and at least NOTCH_MIN_DISTANCE from
@@ -61,13 +69,13 @@ void set_neutral_samples(NotchCalibration& calibration, const uint8_t samples[NO
 // True if a raw stick position lies inside the calibrated neutral range.
 bool in_neutral_range(const NotchCalibration& calibration, const uint8_t raw_stick[2]);
 
-// Warps the whole stick so the calibrated notches land exactly on the ideal notches. The 8 notches
+// Warps the whole stick so the calibrated notches land exactly on their targets. The 8 notches
 // split the stick into 8 slices, each between two neighboring notches and the center. Each slice
-// is stretched evenly (a linear map that sends its two calibrated notches to their ideal
-// positions), so the center stays put and neighboring slices meet without a jump.
+// is stretched evenly (a linear map that sends its two calibrated notches to their targets), so
+// the center stays put and neighboring slices meet without a jump.
 void warp_to_ideal_notches(uint8_t stick[2], const NotchCalibration& calibration);
 
-// For an already warped stick: if it is within `distance` units of an ideal notch, moves it
-// exactly onto that notch. Picks the nearest notch if several are in range. Only calibrated
+// For an already warped stick: if it is within `distance` units of a notch target, moves it
+// exactly onto that target. Picks the nearest notch if several are in range. Only calibrated
 // ports snap.
 void snap_to_notch(uint8_t stick[2], const NotchCalibration& calibration, int distance);

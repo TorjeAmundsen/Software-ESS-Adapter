@@ -4,7 +4,7 @@ How the program works, how to build it, and where things are in the source. For 
 
 ## How it works
 
-Dolphin's own adapter support reads the USB device directly, and nothing else can hook into that path. So the program claims the adapter (WUP-028) with libusb, runs each report through origin centering (with the calibrated neutral range), the notch warp, notch snapping, the ESS range, the dead zone and the ESS map, and serves the result to Dolphin as a DSU (cemuhook) controller over UDP on `127.0.0.1:26760`. It forwards every adapter report as it arrives, so its rate matches the adapter's (125 Hz stock, higher when overclocked).
+Dolphin's own adapter support reads the USB device directly, and nothing else can hook into that path. So the program claims the adapter (WUP-028) with libusb, runs each report through origin centering (with the calibrated neutral range), the notch warp, notch snapping, the ESS range, the dead zone, the ESS map and a pass that keeps each axis moving with its input in game, and serves the result to Dolphin as a DSU (cemuhook) controller over UDP on `127.0.0.1:26760`. It forwards every adapter report as it arrives, so its rate matches the adapter's (125 Hz stock, higher when overclocked).
 
 ### Does the ESS output survive Dolphin?
 
@@ -22,11 +22,17 @@ The ESS range settings are "feel" values. Start S and end E are turned into the 
 
 The software dead zone uses the same feel units, scaled with the range start. It's square: a stick reads 0, 0 when both axes are inside it. It goes up to the range start minus 1, so ESS itself is never affected.
 
-The "In game" plot draws ESS as a rounded square, because OoT removes a dead zone of 7 from each axis before checking the magnitude against 20. With ESS on, a calibrated notch reads 81 straight and 58, 58 diagonally, the furthest VC goes.
+The "In game" plot draws ESS as a rounded square, because OoT removes a dead zone of 7 from each axis before checking the magnitude against 20. With ESS on, a calibrated notch with no notch offset reads 81 straight and 58, 58 diagonally, the furthest VC goes.
 
 ### Notch calibration checks
 
 A notch only counts if it's less than 22.5 degrees from its own direction and at least `NOTCH_MIN_DISTANCE` (half of full tilt) from neutral. That keeps the notches in clockwise order, so the warp can't fold the stick over itself. Each notch press is checked against the current center, and the finished calibration again against the calibrated neutral. Saved calibrations that fail the check load as uncalibrated.
+
+### Notch offsets
+
+Each notch has a notch offset (as in ElectroModder's adapter): the warp sends the calibrated notch to its target, the ideal notch plus the offset, instead of the ideal notch, and snapping snaps to that spot. Offsets are in stick units before the ESS range and ESS map. A target follows the same rule as a calibrated notch: within 22.5 degrees of its own direction and at least `NOTCH_MIN_DISTANCE` from center, so the warp still can't fold. It also has to fit in a stick byte. That's room for setups like an Up-Left notch moved well toward Left for a specific angle (-75, 48 is 12.4 degrees off). They're saved per port as `NotchOffsets`, kept when calibrating again, and removed by Clear. Our ideal diagonal is 75, 75, so offsets copied from an adapter whose diagonal is 70, 70 land somewhere else. The notch offsets window shows the in-game result through the whole path, so check that instead.
+
+Moving a notch target moves both axes, and so does snapping. VC then shortens long sticks (`vc_in_game`), which can pull one axis back as the other moves on, so the in-game value can step backwards even with ESS off: snap 5 alone does it at 8 spots inside the gate, and large offsets at hundreds. So the monotonic pass in `process_stick` runs with ESS off too. Without calibration and with ESS off it changes nothing.
 
 ### DSU buttons
 
@@ -84,8 +90,8 @@ The style is in `.clang-format`: 4-space indents, 140-column lines, and braces o
 - `src/gc_adapter.cpp` reads the adapter with libusb, using the same protocol as Dolphin's `GCAdapter.cpp`.
 - `src/dsu_server.cpp` is the UDP server, with packet layouts from Dolphin's `DualShockUDPProto.h`.
 - `src/ess_range.cpp` has the ESS range remap, the software dead zone, the Wii VC stick mapping (ported from `generate-map.py` in ESS-Adapter), and OoT's dead zone and ESS rules (`PadUtils_UpdateRelXY` and `Player_CalcSpeedAndYawFromControlStick` in the OoT decomp).
-- `src/stick.cpp` has `process_stick`: the main stick's path from the centered stick to what goes to Dolphin (notch warp, snapping, ESS range, software dead zone, ESS map, then a pass that keeps each axis's in-game value, after Wii VC, from ever moving the opposite way to its own input, as the speedrun rules require). That pass is worked out for every stick position at once, into a table per settings and calibration, which takes a few milliseconds the first time each combination is used. The bridge loop and the tests both call it.
-- `src/notch.cpp` has notch calibration, the notch warp, and snapping. The warp splits the stick into 8 slices between neighboring notches and the center, and maps each slice linearly so its two calibrated notches land on the ideal ones.
+- `src/stick.cpp` has `process_stick`: the main stick's path from the centered stick to what goes to Dolphin (notch warp, snapping, ESS range, software dead zone, ESS map, then, ESS on or off, a pass that keeps each axis's in-game value, after Wii VC, from ever moving the opposite way to its own input, as the speedrun rules require). That pass is worked out for every stick position at once, into a table per settings and calibration, which takes a few milliseconds the first time each combination is used (around 50 at most). Near VC's length limit a position can be boxed in: x has to reach as far out as one neighbor and y as far out as another, and VC can't do both. Then the positions further in on the axis that fell short get bounded and the table is worked out again, until nothing is boxed in. The tests sweep every raw stick position for fixed and 150 random settings and calibrations. The bridge loop and the tests both call it.
+- `src/notch.cpp` has notch calibration, the notch warp, and snapping. The warp splits the stick into 8 slices between neighboring notches and the center, and maps each slice linearly so its two calibrated notches land on their targets (the ideal notches plus any notch offsets).
 - `src/main.cpp` has the windows, calibration, the settings file, and the bridge loop: read the adapter, center each stick, `process_stick`, send to Dolphin.
 - `src/resource.h` has the resource ids shared by `assets/resources.rc` and the code.
 - `test/bridge_tests.cpp` has the tests.
