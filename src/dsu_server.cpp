@@ -30,7 +30,7 @@ struct Header {
 struct PortShared {
     uint8_t pad_id;
     uint8_t state;       // 0 disconnected, 2 connected
-    uint8_t model;       // 2 = DS4
+    uint8_t model;       // 2 = full gyro (DS4-like)
     uint8_t connection;  // 1 = USB
     uint8_t mac[6];
     uint8_t battery;  // 5 = full
@@ -116,6 +116,10 @@ static PortShared port_shared(int pad, bool connected) {
     return p;
 }
 
+uint8_t to_dolphin_stick(uint8_t value) {
+    return value >= 1 && value <= 64 ? static_cast<uint8_t>(value - 1) : value;
+}
+
 DsuServer::~DsuServer() {
     stop();
 }
@@ -126,6 +130,7 @@ bool DsuServer::start(uint16_t port) {
         error_ = "WSAStartup failed";
         return false;
     }
+    winsock_started_ = true;
 
     socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     sockaddr_in addr = {};
@@ -156,7 +161,10 @@ void DsuServer::stop() {
     if (socket_ != INVALID_SOCKET) {
         closesocket(socket_);
         socket_ = INVALID_SOCKET;
+    }
+    if (winsock_started_) {
         WSACleanup();
+        winsock_started_ = false;
     }
 }
 
@@ -265,10 +273,10 @@ void DsuServer::publish(const AdapterFrame& frame) {
         msg.packet_counter = packet_counter_[pad]++;
         msg.buttons1 = static_cast<uint8_t>(l << 1 | r << 2 | start << 3 | up << 4 | right << 5 | down << 6 | left << 7);
         msg.buttons2 = static_cast<uint8_t>(z << 3 | y << 4 | b << 5 | a << 6 | x << 7);
-        msg.left_x = gc.stick[0];
-        msg.left_y = gc.stick[1];
-        msg.right_x = gc.cstick[0];
-        msg.right_y = gc.cstick[1];
+        msg.left_x = to_dolphin_stick(gc.stick[0]);
+        msg.left_y = to_dolphin_stick(gc.stick[1]);
+        msg.right_x = to_dolphin_stick(gc.cstick[0]);
+        msg.right_y = to_dolphin_stick(gc.cstick[1]);
         msg.dpad_left = analog(left);
         msg.dpad_down = analog(down);
         msg.dpad_right = analog(right);

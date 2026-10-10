@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include "ess.hpp"
 
@@ -80,9 +81,13 @@ int physical_dead_zone(int in_game) {
     return in_game > 0 ? physical_start(in_game + 1) : 0;
 }
 
-void apply_dead_zone(uint8_t stick[2], int distance) {
+double dead_zone_after_range(int distance, int start) {
+    return static_cast<double>(distance) * ESS_DEFAULT_START / start;
+}
+
+void apply_dead_zone(uint8_t stick[2], double distance) {
     const int x = stick[0] - 128, y = stick[1] - 128;
-    if (x * x + y * y < distance * distance) {
+    if (std::abs(x) < distance && std::abs(y) < distance) {
         stick[0] = 128;
         stick[1] = 128;
     }

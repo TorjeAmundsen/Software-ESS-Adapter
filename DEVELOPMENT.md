@@ -4,11 +4,11 @@ How the program works, how to build it, and where things are in the source. For 
 
 ## How it works
 
-Dolphin's own adapter support reads the USB device directly, and nothing else can hook into that path. So the program claims the adapter (WUP-028) with libusb, runs each report through origin centering, the dead zone, the notch warp, notch snapping, the ESS range and the ESS map, and serves the result to Dolphin as a DSU (cemuhook) controller over UDP on `127.0.0.1:26760`. It forwards every adapter report as it arrives, so its rate matches the adapter's (125 Hz stock, higher when overclocked).
+Dolphin's own adapter support reads the USB device directly, and nothing else can hook into that path. So the program claims the adapter (WUP-028) with libusb, runs each report through origin centering (with the calibrated neutral range), the notch warp, notch snapping, the ESS range, the dead zone and the ESS map, and serves the result to Dolphin as a DSU (cemuhook) controller over UDP on `127.0.0.1:26760`. It forwards every adapter report as it arrives, so its rate matches the adapter's (125 Hz stock, higher when overclocked).
 
 ### Does the ESS output survive Dolphin?
 
-Yes, if the stick has no dead zone and no calibration in Dolphin. Dolphin turns a DSU stick byte `v` into `(v-128)/127` (or `/128` below center), then maps it back to a byte with `MapFloat`. Every value from 0 to 255 comes back unchanged. `bridge-tests` checks all 256 values using Dolphin's formulas. A dead zone or a calibration other than the default rescales the stick and breaks the ESS map.
+Yes, if the stick has no dead zone and no calibration in Dolphin, with one correction on our side. Dolphin turns a DSU stick byte `v` into `(v-128)/127` above center and `(v-128)/128` below, then maps it back to a byte with `MapFloat(x, 128, 1)` (GCPadEmu.cpp), which scales by 127 on both sides. Above center every byte comes back unchanged. Below center, bytes 0 to 64 come back one too high, so ESS full tilt left (64) would arrive as 65. `to_dolphin_stick` in `dsu_server.cpp` sends one less for 1 to 64, so every byte from 1 to 255 arrives as intended (0 can't be reached and arrives as 1). `bridge-tests` checks all of them with Dolphin's formulas. A dead zone or a calibration other than the default in Dolphin rescales the stick and breaks the ESS map.
 
 ## Build
 
@@ -52,16 +52,16 @@ The Validate workflow (`.github/workflows/validate.yml`) builds and runs the tes
 
 ## Code style
 
-The style is in `.clang-format`: 4-space indents, 140-column lines, and braces on every `if` and loop. Visual Studio picks it up automatically. To format from the command line, run `clang-format -i src/*.cpp src/*.hpp test/*.cpp`. `src/ess.cpp` is left out on purpose, through `.clang-format-ignore`, because it's a verbatim copy of `ESS.cpp` from ESS-Adapter.
+The style is in `.clang-format`: 4-space indents, 140-column lines, and braces on every `if` and loop. Visual Studio picks it up automatically. To format from the command line, run `clang-format -i src/*.cpp src/*.hpp test/*.cpp`. `src/ess.cpp` is left out on purpose, through `.clang-format-ignore`, because its functions are copied unchanged from `ESS.cpp` in ESS-Adapter. Only a few defines at the top replace the Arduino-specific memory macros.
 
 ## Source
 
-- `src/ess.cpp` holds the Gamecube functions from `ESS-Adapter/ESS.cpp` in [Skuzee/ESS-Adapter](https://github.com/Skuzee/ESS-Adapter), copied as-is. If the map changes there, copy it here too.
+- `src/ess.cpp` holds the Gamecube functions from `ESS-Adapter/ESS.cpp` in [Skuzee/ESS-Adapter](https://github.com/Skuzee/ESS-Adapter), copied unchanged, with a few defines at the top in place of the Arduino-specific memory macros. If the map changes there, copy the functions here too.
 - `src/gc_adapter.cpp` reads the adapter with libusb, using the same protocol as Dolphin's `GCAdapter.cpp`.
 - `src/dsu_server.cpp` is the UDP server, with packet layouts from Dolphin's `DualShockUDPProto.h`.
 - `src/ess_range.cpp` has the ESS range remap, the software dead zone, the Wii VC stick mapping (ported from `generate-map.py` in ESS-Adapter), and OoT's dead zone and ESS rules (`PadUtils_UpdateRelXY` and `Player_CalcSpeedAndYawFromControlStick` in the OoT decomp).
 - `src/notch.cpp` has notch calibration, the notch warp, and snapping. The warp splits the stick into 8 slices between neighboring notches and the center, and maps each slice linearly so its two calibrated notches land on the ideal ones.
-- `src/main.cpp` has the windows, calibration, the settings file, and the read, warp, snap, ESS range, ESS, send loop.
+- `src/main.cpp` has the windows, calibration, the settings file, and the read, center, warp, snap, ESS range, dead zone, ESS, send loop.
 - `test/bridge_tests.cpp` has the tests.
 - `assets/icon.svg` is the app icon: a GameCube control stick in its octagonal gate. `assets/icon.ico` is made from it and committed, so building doesn't need any image tools. `assets/resources.rc` puts it in the exe. After changing the SVG, regenerate the `.ico` with ImageMagick:
 

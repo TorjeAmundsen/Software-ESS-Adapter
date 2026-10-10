@@ -19,6 +19,12 @@
 
 #include "gc_adapter.hpp"
 
+// The stick byte to send so Dolphin's emulated Gamecube pad ends up with `value`. Dolphin reads
+// a DSU stick byte v below center as (v-128)/128 but maps it back with a scale of 127
+// (GCPadEmu.cpp, MapFloat with neg_1_value 1), so bytes 0 to 64 would arrive one too high.
+// Sending one less for those fixes 1 to 64; 0 cannot be reached and arrives as 1.
+uint8_t to_dolphin_stick(uint8_t value);
+
 class DsuServer {
 public:
     static constexpr uint16_t DEFAULT_PORT = 26760;
@@ -50,6 +56,7 @@ private:
     SOCKET socket_ = INVALID_SOCKET;
     std::thread thread_;
     std::atomic<bool> running_{false};
+    bool winsock_started_ = false;
     std::atomic<std::chrono::steady_clock::rep> last_pad_data_{0};  // steady_clock ticks of the last send
     uint32_t server_id_ = 0;
     std::string error_;

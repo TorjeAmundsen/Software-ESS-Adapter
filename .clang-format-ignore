@@ -1,2 +1,3 @@
-# Verbatim copy of ESS-Adapter/ESS.cpp. Keep it identical so syncing is a plain copy.
+# Functions copied unchanged from ESS-Adapter/ESS.cpp (plus a few defines for the Arduino macros).
+# Keep them identical so syncing stays a copy.
 src/ess.cpp

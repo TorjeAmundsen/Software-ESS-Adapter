@@ -120,18 +120,33 @@ static std::atomic<int> g_snap_distance{DEFAULT_SNAP_DISTANCE};
 // gives (see ess_range.hpp). The distances are recomputed whenever the setting changes.
 static std::atomic<int> g_range_start{ESS_IN_GAME_START};
 static std::atomic<int> g_range_end{ESS_IN_GAME_END};
-static std::atomic<int> g_ess_start{ESS_DEFAULT_START};
-static std::atomic<int> g_ess_end{ESS_DEFAULT_END};
+// Start and end distances packed into one atomic, so the bridge thread never reads a new start
+// with an old end.
+struct RangeDistances {
+    int start;
+    int end;
+};
+static std::atomic<uint32_t> g_range_distances{static_cast<uint32_t>(ESS_DEFAULT_START) << 16 | ESS_DEFAULT_END};
+
+static RangeDistances range_distances() {
+    const uint32_t packed = g_range_distances;
+    return {static_cast<int>(packed >> 16), static_cast<int>(packed & 0xFFFF)};
+}
 
 static void update_range_distances() {
     const int start = physical_start(g_range_start);
-    g_ess_start = start;
-    g_ess_end = std::max(physical_end(g_range_end), start + 1);
+    const int end = std::max(physical_end(g_range_end), start + 1);
+    g_range_distances = static_cast<uint32_t>(start) << 16 | static_cast<uint32_t>(end);
 }
 
 // Software dead zone, in in-game units, and the physical distance it covers.
 static std::atomic<int> g_dead_zone{DEAD_ZONE_DEFAULT};
 static std::atomic<int> g_dead_zone_distance{0};
+// Calibration state. Only the bridge thread changes these; the UI asks for a change through
+// g_calibration_request (a port to start, or -1 to stop), so a button press and a click can't
+// interleave.
+static constexpr int NO_REQUEST = -2;
+static std::atomic<int> g_calibration_request{NO_REQUEST};
 static std::atomic<int> g_calibrating_port{-1};  // -1 when not calibrating
 // Speedrun rules forbid learning more about the controller than looking at it would tell you.
 // So settings, stick readouts, and plots live in a separate settings window, and while it is
@@ -144,7 +159,7 @@ static std::atomic<int> g_calibration_step{0};  // 0 to CALIBRATION_STEPS - 1, s
 static std::mutex g_mutex;  // guards the six below
 static AdapterFrame g_raw{};
 static AdapterFrame g_centered{};    // raw, centered on the origin
-static AdapterFrame g_calibrated{};  // after the dead zone, notch warp and snapping, before the ESS range
+static AdapterFrame g_calibrated{};  // after notch warp and snapping, before the ESS range and dead zone
 static AdapterFrame g_out{};
 static std::string g_adapter_status = "Starting";
 static NotchCalibration g_notches[4];
@@ -277,13 +292,35 @@ static void bridge_loop() {
     bool prev_a[4] = {}, prev_b[4] = {};
     uint8_t samples[CALIBRATION_STEPS][2] = {};  // raw stick per calibration step
 
+    auto take_calibration_request = [] {
+        const int request = g_calibration_request.exchange(NO_REQUEST);
+        if (request != NO_REQUEST) {
+            g_calibration_step = 0;
+            g_calibrating_port = request;
+        }
+    };
+    // Without an adapter, forget every controller: the next one plugged in gets a fresh origin,
+    // and the windows stop showing stale controllers and stick positions.
+    auto forget_controllers = [&] {
+        raw = {};
+        std::fill(std::begin(has_origin), std::end(has_origin), false);
+        g_dsu.publish(AdapterFrame{});  // reports every port as disconnected
+        std::lock_guard lock(g_mutex);
+        g_raw = g_centered = g_calibrated = g_out = AdapterFrame{};
+    };
+    auto wait = [&](int ms) {
+        for (int waited = 0; waited < ms && g_running; waited += 100) {
+            take_calibration_request();
+            Sleep(100);
+        }
+    };
+
     while (g_running) {
+        take_calibration_request();
         if (!adapter.is_open() && !adapter.open()) {
             set_adapter_status(adapter.last_error());
-            g_dsu.publish(AdapterFrame{});  // reports every port as disconnected
-            for (int i = 0; i < 10 && g_running; ++i) {
-                Sleep(100);
-            }
+            forget_controllers();
+            wait(1000);
             continue;
         }
 
@@ -294,6 +331,8 @@ static void bridge_loop() {
         if (result == GCAdapter::ReadResult::Error) {
             set_adapter_status(adapter.last_error());
             adapter.close();
+            forget_controllers();
+            wait(100);  // don't spin if the adapter keeps failing right after opening
             continue;
         }
 
@@ -302,6 +341,7 @@ static void bridge_loop() {
             std::lock_guard lock(g_mutex);
             std::copy(std::begin(g_notches), std::end(g_notches), notches);
         }
+        const RangeDistances range = range_distances();
 
         for (int p = 0; p < 4; ++p) {
             // Like Dolphin and the console: the first report after plugging in is the origin.
@@ -345,12 +385,18 @@ static void bridge_loop() {
             }
 
             out[p] = centered[p];
-            apply_dead_zone(out[p].stick, g_dead_zone_distance);
             warp_to_ideal_notches(out[p].stick, notches[p]);
             snap_to_notch(out[p].stick, notches[p], g_snap_distance);
             calibrated[p] = out[p];
             if (g_ess[p]) {
-                remap_ess_range(out[p].stick, g_ess_start, g_ess_end);
+                remap_ess_range(out[p].stick, range.start, range.end);
+            }
+            // The dead zone goes after everything that moves the stick, scaled along with the ESS
+            // range, so it can never reach into ESS (see dead_zone_after_range).
+            const int dead_zone_distance = g_dead_zone_distance;
+            const double dead_zone = g_ess[p] ? dead_zone_after_range(dead_zone_distance, range.start) : dead_zone_distance;
+            apply_dead_zone(out[p].stick, dead_zone);
+            if (g_ess[p]) {
                 invert_vc_gc(out[p].stick);
             }
 
@@ -546,7 +592,7 @@ static void draw_item(const DRAWITEMSTRUCT& item) {
     }
 }
 
-// Off-screen canvas for one plot and its legend underneath, so the 20 Hz redraw doesn't
+// Off-screen canvas for one plot and its legend underneath, so the 60 Hz redraw doesn't
 // flicker. w and h are the plot square; the legend area follows below it.
 struct Plot {
     HDC dc;
@@ -644,7 +690,8 @@ static void paint_plots(HDC target) {
         calibrated = g_calibrated;
         out = g_out;
     }
-    const int start = g_ess_start, end = g_ess_end;
+    const RangeDistances range = range_distances();
+    const int start = range.start, end = range.end;
 
     // Physical stick: the dead zone and ESS range to scale, inside the Gamecube gate.
     draw_plot(target, STICK_PLOT, STICK_PLOT_SCALE, [&](const Plot& plot) {
@@ -656,7 +703,11 @@ static void paint_plots(HDC target) {
         disk(end, COLOR_ESS_RANGE);
         disk(start, COLOR_DEAD_ZONE);
         if (g_dead_zone_distance > 0) {
-            disk(g_dead_zone_distance, COLOR_SOFTWARE_DEAD_ZONE);
+            // This plot is before the ESS range, where the dead zone has its unscaled size.
+            const double half = g_dead_zone_distance;
+            SetDCPenColor(plot.dc, COLOR_SOFTWARE_DEAD_ZONE);
+            SetDCBrushColor(plot.dc, COLOR_SOFTWARE_DEAD_ZONE);
+            Rectangle(plot.dc, plot.px(-half), plot.py(half), plot.px(half) + 1, plot.py(-half) + 1);
         }
         draw_axes(plot);
         draw_gate(plot, 105, 75, COLOR_BORDER);
@@ -741,12 +792,7 @@ static void on_settings_command(HWND hwnd, int id) {
         InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
     } else if (id >= ID_CALIBRATE && id < ID_CALIBRATE + 4) {
         const int port = id - ID_CALIBRATE;
-        if (g_calibrating_port == port) {
-            g_calibrating_port = -1;
-        } else {
-            g_calibration_step = 0;
-            g_calibrating_port = port;
-        }
+        g_calibration_request = g_calibrating_port == port ? -1 : port;
     } else if (id == ID_SNAP_MINUS || id == ID_SNAP_PLUS) {
         const int step = id == ID_SNAP_PLUS ? 1 : -1;
         g_snap_distance = std::clamp(g_snap_distance + step, 0, MAX_SNAP_DISTANCE);
@@ -767,10 +813,13 @@ static void on_settings_command(HWND hwnd, int id) {
         g_dead_zone_distance = physical_dead_zone(g_dead_zone);
         save_dead_zone();
     } else if (id == ID_RANGE_DEFAULT) {
-        g_range_start = std::max(ESS_IN_GAME_START, g_dead_zone + 1);
+        g_range_start = ESS_IN_GAME_START;
         g_range_end = ESS_IN_GAME_END;
         update_range_distances();
         save_ess_range();
+        g_dead_zone = DEAD_ZONE_DEFAULT;
+        g_dead_zone_distance = physical_dead_zone(g_dead_zone);
+        save_dead_zone();
     }
     refresh_settings(hwnd);
 }
@@ -859,7 +908,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
     }
     case WM_DESTROY:
         // Closing the settings window ends editing: real input goes back to Dolphin.
-        g_calibrating_port = -1;
+        g_calibration_request = -1;
         g_editing = false;
         g_settings_window = nullptr;
         return 0;

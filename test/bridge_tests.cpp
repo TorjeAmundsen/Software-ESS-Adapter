@@ -2,8 +2,8 @@
 
 //The Following code is released under GNU GENERAL PUBLIC LICENSE Version 3.
 
-// 1. Checks that every stick byte survives Dolphin's DSU client + emulated GC pad
-//    math unchanged (copied from DualShockUDPClient.cpp and ControllerEmu.h).
+// 1. Checks that every stick byte we send reaches Dolphin's emulated GC pad as intended
+//    (DSU client math from DualShockUDPClient.cpp, MapFloat from ControllerEmu.h and GCPadEmu.cpp).
 // 2. Talks to DsuServer like Dolphin does and checks the pad data that comes back.
 
 #include <winsock2.h>
@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <utility>
 
 #include "dsu_server.hpp"
@@ -35,18 +36,29 @@ static double dolphin_axis(uint8_t v) {
     return plus - minus;
 }
 
-// Dolphin MapFloat<u8>(x, 128, 0, 255).
+// Dolphin's GC stick: MapFloat<u8>(x, 128, 1) in GCPadEmu.cpp, so 1 at -1.0 and 255 at +1.0.
 static uint8_t dolphin_map_float(double x) {
     if (x > 0) {
         return static_cast<uint8_t>(std::llround((255 - 128) * x + 128));
     }
-    return static_cast<uint8_t>(std::llround((128 - 0) * x + 128));
+    return static_cast<uint8_t>(std::llround((128 - 1) * x + 128));
+}
+
+static uint8_t through_dolphin(uint8_t sent) {
+    return dolphin_map_float(dolphin_axis(sent));
 }
 
 static void test_dolphin_round_trip() {
-    for (int v = 0; v < 256; ++v) {
-        CHECK(dolphin_map_float(dolphin_axis(static_cast<uint8_t>(v))) == v);
+    // Sent as is, bytes 0 to 64 arrive one too high, e.g. ESS full tilt left (64) as 65.
+    CHECK(through_dolphin(64) == 65);
+    CHECK(through_dolphin(65) == 65);
+    // With the correction every byte from 1 to 255 arrives unchanged. 0 is out of reach.
+    bool all_match = true;
+    for (int v = 1; v < 256; ++v) {
+        all_match = all_match && through_dolphin(to_dolphin_stick(static_cast<uint8_t>(v))) == v;
     }
+    CHECK(all_match);
+    CHECK(through_dolphin(to_dolphin_stick(0)) == 1);
 }
 
 static void test_ess_center() {
@@ -171,7 +183,8 @@ static void test_vc_and_conversion() {
     }
     CHECK(skipped);
 
-    // The game's ESS range 8 to 26 is the stock map's 11 to 34, so the defaults change nothing.
+    // The default range, in-game 9 to 26 (8 is unreachable through VC), is the stock map's 11 to 34,
+    // so the defaults change nothing.
     CHECK(physical_start(ESS_IN_GAME_START) == ESS_DEFAULT_START);
     CHECK(physical_end(ESS_IN_GAME_END) == ESS_DEFAULT_END);
     CHECK(physical_start(9) == physical_start(8));  // 8 is unreachable, so 8 and 9 start together
@@ -191,6 +204,14 @@ static void test_vc_and_conversion() {
     uint8_t resting[2] = {129, 129};  // 1, 1
     apply_dead_zone(resting, dead_zone);
     CHECK(resting[0] == 128 && resting[1] == 128);
+    // It's a square, like the game's per-axis dead zone: (3, 3) reads (2, 2) and is caught, while
+    // (4, 0) reads (3, 0) and gets through.
+    uint8_t diagonal[2] = {131, 131};
+    apply_dead_zone(diagonal, dead_zone);
+    CHECK(diagonal[0] == 128 && diagonal[1] == 128);
+    uint8_t past[2] = {132, 128};
+    apply_dead_zone(past, dead_zone);
+    CHECK(past[0] == 132 && past[1] == 128);
 
     // OoT zones: dead zone to 7 per axis, ESS while the rest is shorter than 20.
     CHECK(oot_zone(7, 7) == OotZone::DeadZone);
@@ -210,6 +231,14 @@ static void test_vc_and_conversion() {
     CHECK(both[0] == -mirrored[0] && both[1] == -mirrored[1]);
 }
 
+// In-game value of the stock map (no ESS range remap) at a physical distance on a cardinal,
+// worked out directly from the ESS map and VC, independent of physical_start/physical_end.
+static int stock_reference(int distance) {
+    uint8_t s[2] = {static_cast<uint8_t>(128 + distance), 128};
+    invert_vc_gc(s);
+    return std::abs(vc_in_game(s[0] - 128));
+}
+
 static void test_ess_range() {
     // Defaults change nothing anywhere on the stick.
     bool identity = true;
@@ -222,19 +251,32 @@ static void test_ess_range() {
     }
     CHECK(identity);
 
-    // Ranges set in in-game units. In-game 0-7 is dead zone, 8-26 is ESS (OoT libu64/pad.c,
-    // z_player.c). The physical start lands on ESS and everything below it is dead zone.
-    const int ranges[][2] = {{1, 20}, {5, 26}, {8, 26}, {8, 35}, {15, 45}, {20, max_in_game_end()}};
+    // A range of in-game a to b means: ESS starts where the stock map first reads a or more and
+    // ends where it last reads b or less. In-game 0-7 is dead zone, 8-26 is ESS (OoT libu64/pad.c,
+    // z_player.c). The expected distances come straight from the stock map.
+    const int ranges[][2] = {{1, 20}, {5, 26}, {8, 26}, {9, 26}, {7, 32}, {8, 35}, {15, 45}, {20, max_in_game_end()}};
     for (const auto& range : ranges) {
+        int first = -1, last = -1;
+        for (int d = 0; d <= ESS_MAX_END; ++d) {
+            const int stock = stock_reference(d);
+            if (first < 0 && stock >= range[0]) {
+                first = d;
+            }
+            if (stock <= range[1]) {
+                last = d;
+            }
+        }
         const int start = physical_start(range[0]);
         const int end = physical_end(range[1]);
+        CHECK(start == first);
+        CHECK(end == last);
         for (int direction = 0; direction < 4; ++direction) {
             bool ok = true;
             for (int d = 0; d <= 105; ++d) {
                 const int value = in_game(d, start, end, direction);
-                if (d < start) {
+                if (d < first) {
                     ok = ok && value <= 7;
-                } else if (d <= end) {
+                } else if (d <= last) {
                     ok = ok && value >= 8 && value <= 26;
                 } else {
                     ok = ok && value >= 27;
@@ -246,6 +288,47 @@ static void test_ess_range() {
             CHECK(ok);
         }
     }
+
+    // The dead zone runs after the ESS range and is scaled with it. Two properties for each range
+    // start: at its largest (range start - 1) it zeroes everything that would read 1 to 7 in game
+    // and none of ESS; and with the default range, N = 2 zeroes everything that reads 2 or less.
+    auto pipeline = [](int x, int y, int start, int end, int dead_zone, int game[2]) {
+        uint8_t s[2] = {static_cast<uint8_t>(128 + x), static_cast<uint8_t>(128 + y)};
+        remap_ess_range(s, start, end);
+        apply_dead_zone(s, dead_zone_after_range(dead_zone, start));
+        invert_vc_gc(s);
+        vc_in_game(s[0] - 128, s[1] - 128, game);
+    };
+    for (const int range_start : {3, 9, 15, 20}) {
+        const int start = physical_start(range_start), end = physical_end(26);
+        const int largest = physical_dead_zone(range_start - 1);
+        bool ok = true;
+        for (int x = -60; x <= 60; ++x) {
+            for (int y = -60; y <= 60; ++y) {
+                int game[2];
+                pipeline(x, y, start, end, largest, game);
+                const bool game_dead_zone = std::abs(game[0]) <= 7 && std::abs(game[1]) <= 7;
+                ok = ok && (!game_dead_zone || (game[0] == 0 && game[1] == 0));
+            }
+        }
+        int first_ess[2];
+        pipeline(start, 0, start, end, largest, first_ess);  // the range start itself is still ESS
+        ok = ok && first_ess[0] >= 8;
+        if (!ok) {
+            std::printf("largest dead zone wrong with range start %d\n", range_start);
+        }
+        CHECK(ok);
+    }
+    bool resting_ok = true;
+    for (int x = -60; x <= 60; ++x) {
+        for (int y = -60; y <= 60; ++y) {
+            int game[2];
+            pipeline(x, y, ESS_DEFAULT_START, ESS_DEFAULT_END, physical_dead_zone(2), game);
+            const bool small = std::abs(game[0]) <= 2 && std::abs(game[1]) <= 2;
+            resting_ok = resting_ok && (!small || (game[0] == 0 && game[1] == 0));
+        }
+    }
+    CHECK(resting_ok);
 }
 
 static uint32_t reference_crc32(const uint8_t* p, size_t n) {
@@ -340,13 +423,13 @@ static void test_dsu_server() {
     CHECK(n == 100);
     if (n == 100) {
         CHECK(crc_ok(buf, n));
-        CHECK(buf[20] == 1);    // pad id
-        CHECK(buf[37] & 0x40);  // Cross bit (A)
-        CHECK(buf[37] & 0x08);  // R1 bit (Z)
-        CHECK(buf[40] == 200 && buf[41] == 17);
-        CHECK(buf[49] == 255);  // cross analog
-        CHECK(buf[52] == 255);  // r1 analog
-        CHECK(buf[55] == 99);   // l2 analog
+        CHECK(buf[20] == 1);                     // pad id
+        CHECK(buf[37] & 0x40);                   // Cross bit (A)
+        CHECK(buf[37] & 0x08);                   // R1 bit (Z)
+        CHECK(buf[40] == 200 && buf[41] == 16);  // 17 is sent as 16, see to_dolphin_stick
+        CHECK(buf[49] == 255);                   // cross analog
+        CHECK(buf[52] == 255);                   // r1 analog
+        CHECK(buf[55] == 99);                    // l2 analog
     }
 
     closesocket(client);

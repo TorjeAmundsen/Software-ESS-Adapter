@@ -34,7 +34,7 @@ The program does not do rumble.
 
 Sticks rarely come to rest at exactly 0, 0. With ESS on, a stick resting a unit off center reads 1, 1 or 0, -1 in game. The game ignores that, since its own dead zone is 7, but practice tools like gz show it on screen.
 
-The Dead zone setting is in in-game units. N makes every stick position that would normally read N or less in game read exactly 0, 0. It's a circle around center on your physical stick, applied before notch calibration, the ESS range and ESS. It defaults to 2 and must stay below the ESS range start. 0 turns it off.
+The Dead zone setting uses the same in-game units as the ESS range: N covers the part of the stick that would normally read N or less in game, on both axes, and makes it read exactly 0, 0. It defaults to 2, which with the default ESS range turns a resting 1, 1 into 0, 0. It goes up to just below the ESS range start. At that point everything before ESS reads 0, 0, and ESS itself is never affected. 0 turns it off.
 
 ## ESS range
 
@@ -44,7 +44,7 @@ The ESS range start and end are in-game values. They set how the range feels, no
 
 - **Wider range:** lower the start or raise the end. The stick is stretched along its distance from center, so everything below the start becomes dead zone and everything past the end is spread out to full tilt. Full tilt itself doesn't move.
 - **Lower start:** this also shrinks the dead zone. Anything under the start reads as 0 to 7 in game.
-- **Skipped values:** VC skips 8, 13, 17, 22, and 25. As settings, those behave the same as the next value VC can produce.
+- **Skipped values:** VC skips 8, 13, 17, 22, and 25. As the range start, one of those behaves like the next value VC can produce. As the range end, it behaves like the previous one.
 - **Exact on cardinals only:** the range is exact straight up, down, left, and right. Between the cardinals it's close, but not exact, because the game applies its dead zone to each axis separately.
 
 The ESS range only applies to ports with ESS checked. Default puts both values back.

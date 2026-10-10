@@ -46,14 +46,20 @@ int physical_end(int in_game);
 // Largest in-game end the settings allow.
 int max_in_game_end();
 
-// Software dead zone, in in-game units like the ESS range: N makes every stick position that would
-// normally read N or less in game read exactly 0, 0, so a stick resting at 1, 1 shows 0, 0 in
-// practice tools. It must stay below the ESS range start.
+// Software dead zone, in the same in-game units as the ESS range: N covers where the stick would
+// normally read N or less in game, so with the default range a stick resting at 1, 1 shows 0, 0
+// in practice tools. It goes up to the ESS range start. Below the start, the ESS range stretches
+// the stick evenly onto the game's own dead zone (0 to 7), and the software dead zone is stretched
+// along with it: at range start - 1 it covers exactly that, and never any of ESS.
 constexpr int DEAD_ZONE_DEFAULT = 2;
-// Physical distance below which the dead zone applies (0 = off).
+// Distance from center, per axis, below which the dead zone applies (0 = off).
 int physical_dead_zone(int in_game);
-// Centers the stick if it is closer than `distance` to center.
-void apply_dead_zone(uint8_t stick[2], int distance);
+// The dead zone distance after the ESS range has moved the stick: scaled like everything below
+// the range start, by ESS_DEFAULT_START / start.
+double dead_zone_after_range(int distance, int start);
+// Centers the stick if both axes are closer than `distance` to center (a square, since the game
+// and VC treat each axis separately).
+void apply_dead_zone(uint8_t stick[2], double distance);
 
 // Requires 1 <= start < end <= ESS_MAX_END, in physical distances. Distances below start
 // become dead zone, [start, end] becomes ESS, and above end is stretched out to full tilt
