@@ -75,7 +75,7 @@ With notch snapping on, the stick reads exactly the notch when it's within that 
 
 ### Notch offsets
 
-Notch offsets change where a calibrated notch lands. Click Notch offsets on the port, then use - and + to move each notch on X and Y, in stick units. A notch can move as far as a calibrated notch could be: not past halfway to the next notch, and not too close to the center. Next to each notch, Game shows what OoT reads when you hold it. For example, with ESS on, Down-Right at X 1, Y -6 reads 56, -60 instead of 58, -58. With ESS on, some clicks don't change Game, because nearby stick positions read the same in game. Reset all puts every notch back. Snapping goes to the moved spot, and calibrating again keeps your offsets.
+Notch offsets change where a calibrated notch lands. Click Notch offsets on the port, then use - and + to move each notch on X and Y, in stick units. A notch can move as far as a calibrated notch could be: not past halfway to the next notch, and not too close to the center. Next to each notch, Game shows what OoT reads when you hold it, and the notch you're holding lights up blue. For example, with ESS on, Down-Right at X 1, Y -6 reads 56, -60 instead of 58, -58. With ESS on, some clicks don't change Game, because nearby stick positions read the same in game. Reset all puts every notch back. Snapping goes to the moved spot, and calibrating again keeps your offsets.
 
 ## License
 

@@ -174,6 +174,7 @@ static HWND g_about_window = nullptr;
 // Notch offsets window, owned by the settings window so it only exists while editing.
 static HWND g_offsets_window = nullptr;
 static int g_offsets_port = 0;
+static int g_held_notch = -1;  // the notch the stick is on, highlighted in that window, or -1
 static std::atomic<int> g_calibration_step{0};  // 0 to CALIBRATION_STEPS - 1, see notch.hpp
 
 static std::mutex g_mutex;  // guards the six below
@@ -690,8 +691,8 @@ static void refresh_settings(HWND hwnd) {
             text = buffer;
         }
         set_text(hwnd, ID_PORT_TEXT + p, text);
-        // A calibrated port shows Notch offsets and Clear in place of the text.
-        set_text(hwnd, ID_NOTCH_TEXT + p, calibrated[p] ? "" : "Not calibrated");
+        // A calibrated port shows Notch offsets and Clear in place of the text, except while it calibrates.
+        set_text(hwnd, ID_NOTCH_TEXT + p, calibrating == p ? "Calibrating" : calibrated[p] ? "" : "Not calibrated");
         const bool show_buttons = calibrated[p] && calibrating != p;
         for (const int id : {ID_NOTCH_OFFSETS + p, ID_CLEAR_NOTCHES + p}) {
             HWND button = GetDlgItem(hwnd, id);
@@ -1080,7 +1081,9 @@ static bool handle_dark_controls(UINT msg, WPARAM wparam, LPARAM lparam, LRESULT
         HDC dc = reinterpret_cast<HDC>(wparam);
         const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lparam));
         const bool dim = std::find(g_dim_text.begin(), g_dim_text.end(), reinterpret_cast<HWND>(lparam)) != g_dim_text.end();
-        SetTextColor(dc, dim ? COLOR_DIM_TEXT : COLOR_TEXT);
+        // The held notch's name and Game value in the notch offsets window.
+        const bool held = g_held_notch >= 0 && (id == ID_OFFSET_NAME + g_held_notch || id == ID_OFFSET_GAME + g_held_notch);
+        SetTextColor(dc, held ? COLOR_DOT_IN_RANGE : dim ? COLOR_DIM_TEXT : COLOR_TEXT);
         SetBkColor(dc, COLOR_BG);
         result = reinterpret_cast<LRESULT>(g_bg_brush);
         return true;
@@ -1175,18 +1178,48 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
 static const int OFFSETS_ROW_Y = 70, OFFSETS_ROW_HEIGHT = 28;
 static const int OFFSETS_BOTTOM_Y = OFFSETS_ROW_Y + NOTCH_COUNT * OFFSETS_ROW_HEIGHT + 4;  // the prompt line, then the buttons
 
+// Highlight a notch while the stick, after calibration and snapping, is this close to its target
+// (or within the snap distance, if that's further).
+static constexpr int HELD_DISTANCE = 6;
+
 static void refresh_offsets(HWND hwnd) {
     const int port = g_offsets_port;
     NotchCalibration calibration;
     std::string notice;
+    GCPortState stick;
     {
         std::lock_guard lock(g_mutex);
         calibration = g_notches[port];
+        stick = g_calibrated[port];
         if (std::chrono::steady_clock::now() - g_offsets_notice_time < std::chrono::seconds(4)) {
             notice = g_offsets_notice;
         }
     }
     const StickSettings settings = stick_settings(port);
+
+    int held = -1;
+    if (stick.connected && calibration.valid) {
+        const int reach = std::max(HELD_DISTANCE, settings.snap_distance);
+        int best = reach * reach;
+        for (int i = 0; i < NOTCH_COUNT; ++i) {
+            int target[2];
+            notch_target(calibration, i, target);
+            const int dx = stick.stick[0] - 128 - target[0], dy = stick.stick[1] - 128 - target[1];
+            if (dx * dx + dy * dy <= best) {
+                best = dx * dx + dy * dy;
+                held = i;
+            }
+        }
+    }
+    if (held != g_held_notch) {
+        for (const int notch : {g_held_notch, held}) {
+            if (notch >= 0) {
+                InvalidateRect(GetDlgItem(hwnd, ID_OFFSET_NAME + notch), nullptr, TRUE);
+                InvalidateRect(GetDlgItem(hwnd, ID_OFFSET_GAME + notch), nullptr, TRUE);
+            }
+        }
+        g_held_notch = held;
+    }
     // With ESS on, the ESS map gives the same in-game value for neighboring sticks, so a click
     // doesn't always change Game.
     if (notice.empty() && settings.ess) {
@@ -1300,6 +1333,7 @@ static LRESULT CALLBACK offsets_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
         return 0;
     case WM_DESTROY:
         g_offsets_window = nullptr;
+        g_held_notch = -1;
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wparam, lparam);
