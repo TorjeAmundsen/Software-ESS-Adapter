@@ -8,7 +8,29 @@ Dolphin's own adapter support reads the USB device directly, and nothing else ca
 
 ### Does the ESS output survive Dolphin?
 
-Yes, if the stick has no dead zone and no calibration in Dolphin, with one correction on our side. Dolphin turns a DSU stick byte `v` into `(v-128)/127` above center and `(v-128)/128` below, then maps it back to a byte with `MapFloat(x, 128, 1)` (GCPadEmu.cpp), which scales by 127 on both sides. Above center every byte comes back unchanged. Below center, bytes 0 to 64 come back one too high, so ESS full tilt left (64) would arrive as 65. `to_dolphin_stick` in `dsu_server.cpp` sends one less for 1 to 64, so every byte from 1 to 255 arrives as intended (0 can't be reached and arrives as 1). `bridge-tests` checks all of them with Dolphin's formulas. A dead zone or a calibration other than the default in Dolphin rescales the stick and breaks the ESS map.
+Yes, if the stick has no dead zone and no calibration in Dolphin, with one correction on our side. Dolphin turns a DSU stick byte `v` into `(v-128)/127` above center and `(v-128)/128` below, then maps it back to a byte with `MapFloat(x, 128, 1)` (GCPadEmu.cpp), which scales by 127 on both sides. Above center every byte comes back unchanged. Below center, bytes 0 to 64 come back one too high, so ESS full tilt left (64) would arrive as 65. `to_dolphin_stick` in `dsu_server.cpp` sends one less for 1 to 64, so every byte from 1 to 255 arrives as intended (0 can't be reached and arrives as 1). `bridge-tests` checks all of them with Dolphin's formulas. A dead zone or a calibration other than the default in Dolphin rescales the stick and breaks the ESS map. The profile doesn't need to set them: loading a profile resets any setting it leaves out to its default (`NumericSetting::LoadFromIni`), and an empty calibration and center mean the defaults (`ReshapableInput::LoadConfig`).
+
+### Centering
+
+Without calibrated notches, the first report after a controller is plugged in is its origin, like Dolphin and the console. With calibrated notches, the 8 neutral samples replace it. Their average is the center, and any position between the smallest and largest sample on each axis reads exactly 0, 0. So the center survives replugs and power cycles.
+
+### ESS range and software dead zone
+
+OoT turns Link in place without walking when the in-game stick value is 8 to 26 on a cardinal. 0 to 7 is the game's dead zone, and walking starts at magnitude 20 (27 on a cardinal), per `PadUtils_UpdateRelXY` and `Player_CalcSpeedAndYawFromControlStick` in the OoT decomp. VC never produces 8, 13, 17, 22 or 25, so 9 is the first reachable ESS value.
+
+The ESS range settings are "feel" values. Start S and end E are turned into the physical distances where the stock map reads S and E in game, and the stick is remapped radially so those distances land on the stock 9 and 26. Below the start goes into the game dead zone, past the end is spread out to full tilt, and full tilt doesn't move. A skipped value behaves like the next reachable value as a start and the previous one as an end. The range is exact on cardinals only, because the game applies its dead zone per axis.
+
+The software dead zone uses the same feel units, scaled with the range start. It's square: a stick reads 0, 0 when both axes are inside it. It goes up to the range start minus 1, so ESS itself is never affected.
+
+The "In game" plot draws ESS as a rounded square, because OoT removes a dead zone of 7 from each axis before checking the magnitude against 20. With ESS on, a calibrated notch reads 81 straight and 58, 58 diagonally, the furthest VC goes.
+
+### Notch calibration checks
+
+A notch only counts if it's less than 22.5 degrees from its own direction and at least `NOTCH_MIN_DISTANCE` (half of full tilt) from neutral. That keeps the notches in clockwise order, so the warp can't fold the stick over itself. Each notch press is checked against the current center, and the finished calibration again against the calibrated neutral. Saved calibrations that fail the check load as uncalibrated.
+
+### DSU buttons
+
+DSU copies a PlayStation controller, so Gamecube buttons go out under PlayStation names (A is Cross, Z is R1, and so on). `dolphin/Software ESS Adapter.ini` has the full mapping. To map the main stick by hand in Dolphin, ESS has to be off for that port: ESS output never goes past half deflection, because VC already treats that as full tilt, and Dolphin only registers a stick direction for mapping past 55%.
 
 ## Build
 
