@@ -1,0 +1,17 @@
+# Build output (build.ps1 and CMake builds)
+dist/
+build/
+build-*/
+out/
+*.exe
+*.zip
+
+# Personal settings and calibration the program writes next to the exe
+/Software ESS Adapter.ini
+/ess-dolphin-bridge.ini
+
+# Editor and tool files
+.vs/
+.vscode/
+.cache/
+CMakeUserPresets.json

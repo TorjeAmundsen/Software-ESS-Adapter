@@ -1,0 +1,24 @@
+name: Validate build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # MSVC, plus the CMake and Ninja that ship with Visual Studio, on PATH.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build
+        run: ./build.ps1
+
+      - name: Build tests
+        run: cmake --build build --target bridge-tests
+
+      - name: Run tests
+        run: ./build/bridge-tests.exe

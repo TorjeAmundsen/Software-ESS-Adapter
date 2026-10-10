@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Octagonal gate, corners at the eight notches -->
+  <polygon points="248,128 212.85,43.15 128,8 43.15,43.15 8,128 43.15,212.85 128,248 212.85,212.85"
+           fill="#4b3f8c" stroke="#2e2659" stroke-width="8" stroke-linejoin="round"/>
+  <!-- Stick cap with its dished center -->
+  <circle cx="128" cy="128" r="74" fill="#d6d6dc" stroke="#8c8c96" stroke-width="6"/>
+  <circle cx="128" cy="128" r="46" fill="#b9b9c2"/>
+</svg>

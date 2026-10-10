@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # The tag must be "v" plus APP_VERSION in CMakeLists.txt, e.g. v0.1.0-alpha.
+      - name: Check tag matches version
+        run: |
+          $version = (Select-String -Path CMakeLists.txt -Pattern 'set\(APP_VERSION "([^"]+)"\)').Matches[0].Groups[1].Value
+          if ('${{ github.ref_name }}' -cne "v$version") {
+            Write-Error "Tag ${{ github.ref_name }} does not match APP_VERSION $version in CMakeLists.txt"
+            exit 1
+          }
+
+      # MSVC, plus the CMake and Ninja that ship with Visual Studio, on PATH.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build
+        run: ./build.ps1
+
+      - name: Build tests
+        run: cmake --build build --target bridge-tests
+
+      - name: Run tests
+        run: ./build/bridge-tests.exe
+
+      - name: Name zip
+        run: Move-Item dist/software-ess-adapter.zip "dist/software-ess-adapter-${{ github.ref_name }}-win-x64.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-win-x64
+          path: dist/software-ess-adapter-${{ github.ref_name }}-win-x64.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*.zip
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body: ''

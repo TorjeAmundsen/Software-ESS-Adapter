@@ -1,0 +1,81 @@
+# Developing Software ESS Adapter
+
+How the program works, how to build it, and where things are in the source. For using it, see [README.md](README.md).
+
+## How it works
+
+Dolphin's own adapter support reads the USB device directly, and nothing else can hook into that path. So the program claims the adapter (WUP-028) with libusb, runs each report through origin centering, the dead zone, the notch warp, notch snapping, the ESS range and the ESS map, and serves the result to Dolphin as a DSU (cemuhook) controller over UDP on `127.0.0.1:26760`. It forwards every adapter report as it arrives, so its rate matches the adapter's (125 Hz stock, higher when overclocked).
+
+### Does the ESS output survive Dolphin?
+
+Yes, if the stick has no dead zone and no calibration in Dolphin. Dolphin turns a DSU stick byte `v` into `(v-128)/127` (or `/128` below center), then maps it back to a byte with `MapFloat`. Every value from 0 to 255 comes back unchanged. `bridge-tests` checks all 256 values using Dolphin's formulas. A dead zone or a calibration other than the default rescales the stick and breaks the ESS map.
+
+## Build
+
+You need CMake 3.20+, Ninja, and a C++17 compiler on PATH. Either works:
+
+- **MinGW-w64 g++**, for example from [MSYS2](https://www.msys2.org/) (`C:\msys64\mingw64\bin` on PATH).
+- **MSVC cl**, from a Visual Studio developer prompt.
+
+```
+.\build.ps1
+```
+
+This builds the program and writes `dist/software-ess-adapter.zip` with the exe and the Dolphin profile. The exe has the C++ runtime built in, so it only needs DLLs that come with Windows.
+
+To run the tests:
+
+```
+cmake --build build --target bridge-tests
+.\build\bridge-tests.exe
+```
+
+CMake downloads libusb 1.0.27 and compiles its Windows sources directly, since libusb has no CMake build. libusb only ships a `config.h` for MSVC, so `cmake/libusb-mingw/config.h` provides the same settings for MinGW. To build offline, point CMake at any libusb checkout, for example Dolphin's, with `-DFETCHCONTENT_SOURCE_DIR_LIBUSB="<dolphin>/Externals/libusb/libusb"`.
+
+## Releases
+
+The version is `APP_VERSION` in `CMakeLists.txt` (`set(APP_VERSION "0.1.0-alpha")`). It follows semver, optionally with a prerelease suffix like `-alpha` or `-beta.1`. The About window shows it as "Software ESS Adapter v0.1.0-alpha".
+
+To release:
+
+1. Bump `APP_VERSION` in `CMakeLists.txt` and merge it to `main`.
+2. Tag the commit and push the tag:
+
+   ```
+   git tag v0.1.0-alpha
+   git push origin v0.1.0-alpha
+   ```
+
+The Release workflow (`.github/workflows/release.yml`) checks that the tag is exactly `v` plus `APP_VERSION`, runs the tests, builds `software-ess-adapter-v0.1.0-alpha-win-x64.zip`, and creates a draft GitHub release with it. Review the draft and publish it. A version with a suffix becomes a prerelease.
+
+The Validate workflow (`.github/workflows/validate.yml`) builds and runs the tests on every pull request and every push to `main`.
+
+## Code style
+
+The style is in `.clang-format`: 4-space indents, 140-column lines, and braces on every `if` and loop. Visual Studio picks it up automatically. To format from the command line, run `clang-format -i src/*.cpp src/*.hpp test/*.cpp`. `src/ess.cpp` is left out on purpose, through `.clang-format-ignore`, because it's a verbatim copy of `ESS.cpp` from ESS-Adapter.
+
+## Source
+
+- `src/ess.cpp` holds the Gamecube functions from `ESS-Adapter/ESS.cpp` in [Skuzee/ESS-Adapter](https://github.com/Skuzee/ESS-Adapter), copied as-is. If the map changes there, copy it here too.
+- `src/gc_adapter.cpp` reads the adapter with libusb, using the same protocol as Dolphin's `GCAdapter.cpp`.
+- `src/dsu_server.cpp` is the UDP server, with packet layouts from Dolphin's `DualShockUDPProto.h`.
+- `src/ess_range.cpp` has the ESS range remap, the software dead zone, the Wii VC stick mapping (ported from `generate-map.py` in ESS-Adapter), and OoT's dead zone and ESS rules (`PadUtils_UpdateRelXY` and `Player_CalcSpeedAndYawFromControlStick` in the OoT decomp).
+- `src/notch.cpp` has notch calibration, the notch warp, and snapping. The warp splits the stick into 8 slices between neighboring notches and the center, and maps each slice linearly so its two calibrated notches land on the ideal ones.
+- `src/main.cpp` has the windows, calibration, the settings file, and the read, warp, snap, ESS range, ESS, send loop.
+- `test/bridge_tests.cpp` has the tests.
+- `assets/icon.svg` is the app icon: a GameCube control stick in its octagonal gate. `assets/icon.ico` is made from it and committed, so building doesn't need any image tools. `assets/resources.rc` puts it in the exe. After changing the SVG, regenerate the `.ico` with ImageMagick:
+
+  ```
+  magick -background none -density 384 assets/icon.svg -define icon:auto-resize=256,64,48,32,24,16 assets/icon.ico
+  ```
+
+## Licenses
+
+The program is GPLv3 (`LICENSE.md`). The release zip has no separate license files. Instead, `assets/resources.rc` builds `LICENSE.md` and `assets/licenses/third-party.txt` into the exe, and the About window shows the credits, the no-warranty notice, and the source link, as GPLv3 asks of interactive programs. Its Licenses button writes both texts to a temporary text file and opens it in the default text editor.
+
+`assets/licenses/third-party.txt` covers what ends up inside the exe:
+
+- **libusb:** LGPL 2.1, built in from source. Its copyright lines come from libusb's `AUTHORS`, and the license text from its `COPYING`.
+- **MinGW-w64 runtime and winpthreads:** only in MinGW builds, from MSYS2's `share/licenses/crt/COPYING.MinGW-w64-runtime.txt` and `share/licenses/winpthreads/COPYING`.
+
+The GCC runtime needs no notice (GCC Runtime Library Exception), and MSVC's runtime needs none either. If you update libusb or change toolchains, update this file to match.

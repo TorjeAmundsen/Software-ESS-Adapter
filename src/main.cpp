@@ -1,0 +1,1116 @@
+//main.cpp
+
+//The Following code is released under GNU GENERAL PUBLIC LICENSE Version 3.
+
+// Software ESS Adapter: reads a Gamecube adapter, applies the ESS map from this
+// repository, and serves the result to Dolphin as a DSU controller.
+
+#include <winsock2.h>
+#include <windows.h>
+#include <dwmapi.h>
+#include <shellapi.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "dsu_server.hpp"
+#include "ess.hpp"
+#include "ess_range.hpp"
+#include "gc_adapter.hpp"
+#include "notch.hpp"
+
+// Newer Windows SDK values that older mingw-w64 headers don't have.
+static constexpr DWORD DWM_USE_IMMERSIVE_DARK_MODE = 20;  // DWMWA_USE_IMMERSIVE_DARK_MODE
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+enum ControlId {
+    ID_ADAPTER_STATUS = 100,
+    ID_DSU_STATUS,
+    ID_SNAP_LABEL,
+    ID_SNAP_MINUS,
+    ID_SNAP_VALUE,
+    ID_SNAP_PLUS,
+    ID_SNAP_HINT,
+    ID_RANGE_LABEL,
+    ID_RANGE_START_MINUS,
+    ID_RANGE_START_VALUE,
+    ID_RANGE_START_PLUS,
+    ID_RANGE_END_LABEL,
+    ID_RANGE_END_MINUS,
+    ID_RANGE_END_VALUE,
+    ID_RANGE_END_PLUS,
+    ID_RANGE_DEFAULT,
+    ID_EDIT,
+    ID_MAIN_HINT,
+    ID_PROMPT,
+    ID_DONE,
+    ID_STICK_PLOT_TITLE,
+    ID_GAME_PLOT_TITLE,
+    ID_DEAD_ZONE_LABEL,
+    ID_DEAD_ZONE_MINUS,
+    ID_DEAD_ZONE_VALUE,
+    ID_DEAD_ZONE_PLUS,
+    ID_DEAD_ZONE_HINT,
+    ID_ABOUT,
+    ID_ABOUT_TITLE,
+    ID_ABOUT_CREDITS,
+    ID_ABOUT_LEGAL,
+    ID_ABOUT_SOURCE,
+    ID_ABOUT_LICENSES,
+    ID_ABOUT_CLOSE,
+    ID_ESS_CHECK = 200,
+    ID_CALIBRATE = 300,
+    ID_PORT_TEXT = 400,
+    ID_NOTCH_TEXT = 500,
+    ID_MAIN_PORT = 600
+};
+
+static const COLORREF COLOR_BG = RGB(32, 32, 32);
+static const COLORREF COLOR_TEXT = RGB(230, 230, 230);
+static const COLORREF COLOR_DIM_TEXT = RGB(150, 150, 150);
+static const COLORREF COLOR_FACE = RGB(55, 55, 55);
+static const COLORREF COLOR_FACE_DOWN = RGB(80, 80, 80);
+static const COLORREF COLOR_BORDER = RGB(95, 95, 95);
+static const COLORREF COLOR_ACCENT = RGB(0, 120, 215);
+static const COLORREF COLOR_PLOT_BG = RGB(24, 24, 24);
+static const COLORREF COLOR_PLOT_AXIS = RGB(50, 50, 50);
+static const COLORREF COLOR_DEAD_ZONE = RGB(70, 70, 70);
+static const COLORREF COLOR_ESS_RANGE = RGB(0, 70, 125);
+static const COLORREF COLOR_DOT_IN_RANGE = RGB(80, 200, 255);
+static const COLORREF COLOR_FULL_SPEED = RGB(150, 110, 40);
+static const COLORREF COLOR_SOFTWARE_DEAD_ZONE = RGB(110, 110, 110);
+static const COLORREF COLOR_CALIBRATION_TARGET = RGB(90, 210, 120);
+static const COLORREF COLOR_ACTIVE = RGB(60, 200, 90);
+static const COLORREF COLOR_PAUSED = RGB(230, 170, 50);
+
+// Status indicator in the main window's top right corner: amber "Paused" while the settings
+// window is open (Dolphin only gets a neutral controller), green "Active" while controller data
+// is going out to Dolphin, gray "Idle" otherwise.
+enum class LinkState { Idle, Active, Paused };
+static const RECT ACTIVE_RECT = {350, 10, 420, 28};
+static LinkState g_shown_state = LinkState::Idle;
+
+// Plots in the settings window: the physical stick, and what OoT receives.
+static const RECT STICK_PLOT = {10, 252, 266, 508};
+static const RECT GAME_PLOT = {276, 252, 532, 508};
+static constexpr double STICK_PLOT_SCALE = 1.05;  // pixels per Gamecube stick unit; fits a ring at 105 + 12
+static constexpr double GAME_PLOT_SCALE = 1.5;    // pixels per in-game unit
+static constexpr int LEGEND_HEIGHT = 62;          // below each plot, so it covers nothing
+static const char* const SETTINGS_CLASS = "SoftwareESSAdapterSettings";
+static constexpr int APP_ICON = 1;  // resource ids in assets/resources.rc
+static constexpr int GPL_TEXT = 2;
+static constexpr int THIRD_PARTY_TEXT = 3;
+static const char* const ABOUT_CLASS = "SoftwareESSAdapterAbout";
+static const char* const SOURCE_URL = "https://github.com/TorjeAmundsen/Software-ESS-Adapter";
+
+static DsuServer g_dsu;
+static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_ess[4] = {true, true, true, true};
+static std::atomic<int> g_snap_distance{DEFAULT_SNAP_DISTANCE};
+// ESS range as the user sets it, in in-game units, and the physical stick distances that
+// gives (see ess_range.hpp). The distances are recomputed whenever the setting changes.
+static std::atomic<int> g_range_start{ESS_IN_GAME_START};
+static std::atomic<int> g_range_end{ESS_IN_GAME_END};
+static std::atomic<int> g_ess_start{ESS_DEFAULT_START};
+static std::atomic<int> g_ess_end{ESS_DEFAULT_END};
+
+static void update_range_distances() {
+    const int start = physical_start(g_range_start);
+    g_ess_start = start;
+    g_ess_end = std::max(physical_end(g_range_end), start + 1);
+}
+
+// Software dead zone, in in-game units, and the physical distance it covers.
+static std::atomic<int> g_dead_zone{DEAD_ZONE_DEFAULT};
+static std::atomic<int> g_dead_zone_distance{0};
+static std::atomic<int> g_calibrating_port{-1};  // -1 when not calibrating
+// Speedrun rules forbid learning more about the controller than looking at it would tell you.
+// So settings, stick readouts, and plots live in a separate settings window, and while it is
+// open Dolphin gets a neutral controller instead of real input.
+static std::atomic<bool> g_editing{false};
+static HWND g_settings_window = nullptr;
+static HWND g_about_window = nullptr;
+static std::atomic<int> g_calibration_step{0};  // 0 to CALIBRATION_STEPS - 1, see notch.hpp
+
+static std::mutex g_mutex;  // guards the six below
+static AdapterFrame g_raw{};
+static AdapterFrame g_centered{};    // raw, centered on the origin
+static AdapterFrame g_calibrated{};  // after the dead zone, notch warp and snapping, before the ESS range
+static AdapterFrame g_out{};
+static std::string g_adapter_status = "Starting";
+static NotchCalibration g_notches[4];
+
+static HBRUSH g_bg_brush;
+static HFONT g_font;
+static HFONT g_mono_font;   // stick readouts
+static HFONT g_title_font;  // About window heading
+
+// Settings live next to the exe: Software ESS Adapter.ini
+static std::string settings_path() {
+    char path[MAX_PATH];
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    const std::string exe = path;
+    return exe.substr(0, exe.find_last_of('.')) + ".ini";
+}
+
+static std::string port_section(int port) {
+    return "Port" + std::to_string(port + 1);
+}
+
+// Reads "a,b,c,..." with exactly `count` integers in [min, max].
+static bool read_ints(const std::string& path, const std::string& section, const char* key, int* values, int count, int min, int max) {
+    char buffer[256];
+    GetPrivateProfileStringA(section.c_str(), key, "", buffer, sizeof(buffer), path.c_str());
+    const char* cursor = buffer;
+    for (int i = 0; i < count; ++i) {
+        char* end;
+        const long value = std::strtol(cursor, &end, 10);
+        if (end == cursor || value < min || value > max) {
+            return false;
+        }
+        values[i] = static_cast<int>(value);
+        cursor = *end == ',' ? end + 1 : end;
+    }
+    return true;
+}
+
+static void load_settings() {
+    const std::string path = settings_path();
+    g_snap_distance =
+        std::clamp<int>(GetPrivateProfileIntA("Settings", "SnapDistance", DEFAULT_SNAP_DISTANCE, path.c_str()), 0, MAX_SNAP_DISTANCE);
+
+    g_range_start =
+        std::clamp<int>(GetPrivateProfileIntA("Settings", "EssStartInGame", ESS_IN_GAME_START, path.c_str()), 1, max_in_game_end() - 1);
+    g_range_end = std::clamp<int>(GetPrivateProfileIntA("Settings", "EssEndInGame", ESS_IN_GAME_END, path.c_str()), g_range_start + 1,
+                                  max_in_game_end());
+    update_range_distances();
+    g_dead_zone =
+        std::clamp<int>(GetPrivateProfileIntA("Settings", "DeadZoneInGame", DEAD_ZONE_DEFAULT, path.c_str()), 0, g_range_start - 1);
+    g_dead_zone_distance = physical_dead_zone(g_dead_zone);
+
+    for (int p = 0; p < 4; ++p) {
+        // NeutralSamples = the 8 raw x,y pairs recorded at rest. Notches = x,y pairs in
+        // NOTCH_NAMES order, offsets from the average neutral.
+        int neutral[NOTCH_COUNT * 2], notches[NOTCH_COUNT * 2];
+        NotchCalibration calibration;
+        calibration.valid = read_ints(path, port_section(p), "NeutralSamples", neutral, NOTCH_COUNT * 2, 0, 255) &&
+                            read_ints(path, port_section(p), "Notches", notches, NOTCH_COUNT * 2, -128, 127);
+        if (calibration.valid) {
+            uint8_t samples[NOTCH_COUNT][2];
+            for (int i = 0; i < NOTCH_COUNT * 2; ++i) {
+                samples[i / 2][i % 2] = static_cast<uint8_t>(neutral[i]);
+            }
+            set_neutral_samples(calibration, samples);
+            for (int i = 0; i < NOTCH_COUNT * 2; ++i) {
+                calibration.notch[i / 2][i % 2] = static_cast<int8_t>(notches[i]);
+            }
+        }
+        g_notches[p] = calibration;
+    }
+}
+
+static void save_snap_distance() {
+    WritePrivateProfileStringA("Settings", "SnapDistance", std::to_string(g_snap_distance).c_str(), settings_path().c_str());
+}
+
+static void save_dead_zone() {
+    WritePrivateProfileStringA("Settings", "DeadZoneInGame", std::to_string(g_dead_zone).c_str(), settings_path().c_str());
+}
+
+static void save_ess_range() {
+    const std::string path = settings_path();
+    WritePrivateProfileStringA("Settings", "EssStartInGame", std::to_string(g_range_start).c_str(), path.c_str());
+    WritePrivateProfileStringA("Settings", "EssEndInGame", std::to_string(g_range_end).c_str(), path.c_str());
+}
+
+static void save_notches(int port, const NotchCalibration& calibration) {
+    std::string value;
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        value += std::to_string(calibration.notch[i][0]) + "," + std::to_string(calibration.notch[i][1]);
+        if (i + 1 < NOTCH_COUNT) {
+            value += ",";
+        }
+    }
+    std::string neutral;
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        neutral += std::to_string(calibration.neutral_samples[i][0]) + "," + std::to_string(calibration.neutral_samples[i][1]);
+        if (i + 1 < NOTCH_COUNT) {
+            neutral += ",";
+        }
+    }
+    WritePrivateProfileStringA(port_section(port).c_str(), "NeutralSamples", neutral.c_str(), settings_path().c_str());
+    WritePrivateProfileStringA(port_section(port).c_str(), "Notches", value.c_str(), settings_path().c_str());
+}
+
+static void set_adapter_status(const std::string& status) {
+    std::lock_guard lock(g_mutex);
+    g_adapter_status = status;
+}
+
+static GCPortState center(const GCPortState& raw, const GCPortState& origin) {
+    // Dolphin's emulated pad always reports a centered origin, so center
+    // everything here the way the game would against the real origin.
+    GCPortState out = raw;
+    uint8_t stick_origin[2] = {origin.stick[0], origin.stick[1]};
+    normalize_origin(out.stick, stick_origin);
+    uint8_t cstick_origin[2] = {origin.cstick[0], origin.cstick[1]};
+    normalize_origin(out.cstick, cstick_origin);
+    for (int i = 0; i < 2; ++i) {
+        out.trigger[i] = raw.trigger[i] > origin.trigger[i] ? raw.trigger[i] - origin.trigger[i] : 0;
+    }
+    return out;
+}
+
+static void bridge_loop() {
+    GCAdapter adapter;
+    AdapterFrame raw{}, centered{}, calibrated{}, out{}, sent{}, origin{};
+    bool has_origin[4] = {};
+    bool prev_a[4] = {}, prev_b[4] = {};
+    uint8_t samples[CALIBRATION_STEPS][2] = {};  // raw stick per calibration step
+
+    while (g_running) {
+        if (!adapter.is_open() && !adapter.open()) {
+            set_adapter_status(adapter.last_error());
+            g_dsu.publish(AdapterFrame{});  // reports every port as disconnected
+            for (int i = 0; i < 10 && g_running; ++i) {
+                Sleep(100);
+            }
+            continue;
+        }
+
+        const GCAdapter::ReadResult result = adapter.read(raw);
+        if (result == GCAdapter::ReadResult::Timeout) {
+            continue;
+        }
+        if (result == GCAdapter::ReadResult::Error) {
+            set_adapter_status(adapter.last_error());
+            adapter.close();
+            continue;
+        }
+
+        NotchCalibration notches[4];
+        {
+            std::lock_guard lock(g_mutex);
+            std::copy(std::begin(g_notches), std::end(g_notches), notches);
+        }
+
+        for (int p = 0; p < 4; ++p) {
+            // Like Dolphin and the console: the first report after plugging in is the origin.
+            if (raw[p].connected && !has_origin[p]) {
+                origin[p] = raw[p];
+            }
+            has_origin[p] = raw[p].connected;
+            // A calibrated port centers the main stick on its saved neutral instead.
+            GCPortState port_origin = origin[p];
+            if (notches[p].valid) {
+                port_origin.stick[0] = notches[p].neutral[0];
+                port_origin.stick[1] = notches[p].neutral[1];
+            }
+            centered[p] = center(raw[p], port_origin);
+            // Anywhere the stick was seen resting during calibration counts as exactly neutral.
+            if (in_neutral_range(notches[p], raw[p].stick)) {
+                centered[p].stick[0] = 128;
+                centered[p].stick[1] = 128;
+            }
+            const bool a = raw[p].buttons1 & 0x01;
+            const bool b = raw[p].buttons1 & 0x02;
+
+            if (p == g_calibrating_port) {
+                // A records the current notch, B cancels.
+                if (b && !prev_b[p]) {
+                    g_calibrating_port = -1;
+                } else if (a && !prev_a[p]) {
+                    const int step = g_calibration_step;
+                    samples[step][0] = raw[p].stick[0];
+                    samples[step][1] = raw[p].stick[1];
+                    if (step + 1 < CALIBRATION_STEPS) {
+                        g_calibration_step = step + 1;
+                    } else {
+                        const NotchCalibration calibration = make_calibration(samples);
+                        save_notches(p, calibration);
+                        std::lock_guard lock(g_mutex);
+                        g_notches[p] = calibration;
+                        g_calibrating_port = -1;
+                    }
+                }
+            }
+
+            out[p] = centered[p];
+            apply_dead_zone(out[p].stick, g_dead_zone_distance);
+            warp_to_ideal_notches(out[p].stick, notches[p]);
+            snap_to_notch(out[p].stick, notches[p], g_snap_distance);
+            calibrated[p] = out[p];
+            if (g_ess[p]) {
+                remap_ess_range(out[p].stick, g_ess_start, g_ess_end);
+                invert_vc_gc(out[p].stick);
+            }
+
+            // Calibration only happens while editing, so this also covers it.
+            sent[p] = out[p];
+            if (g_editing) {
+                sent[p] = GCPortState{};
+                sent[p].connected = raw[p].connected;
+            }
+            prev_a[p] = a;
+            prev_b[p] = b;
+        }
+        g_dsu.publish(sent);
+
+        std::lock_guard lock(g_mutex);
+        g_raw = raw;
+        g_centered = centered;
+        g_calibrated = calibrated;
+        g_out = out;
+        g_adapter_status = "Adapter connected";
+    }
+}
+
+static void set_text(HWND hwnd, int id, const std::string& text) {
+    char current[256];
+    GetDlgItemTextA(hwnd, id, current, sizeof(current));
+    if (text != current) {
+        SetDlgItemTextA(hwnd, id, text.c_str());
+        InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);  // owner-drawn buttons need this
+    }
+}
+
+// Main window: connection status only, no controller values.
+static void refresh_main(HWND hwnd) {
+    AdapterFrame raw;
+    std::string status;
+    {
+        std::lock_guard lock(g_mutex);
+        raw = g_raw;
+        status = g_adapter_status;
+    }
+    set_text(hwnd, ID_ADAPTER_STATUS, status);
+    if (g_dsu.last_error().empty()) {
+        set_text(hwnd, ID_DSU_STATUS,
+                 "DSU server on 127.0.0.1:" + std::to_string(DsuServer::DEFAULT_PORT) +
+                     ", Dolphin clients: " + std::to_string(g_dsu.client_count()));
+    }
+    for (int p = 0; p < 4; ++p) {
+        set_text(hwnd, ID_MAIN_PORT + p,
+                 "Port " + std::to_string(p + 1) + ": " + (raw[p].connected ? "controller connected" : "no controller"));
+    }
+    set_text(hwnd, ID_EDIT, g_settings_window ? "Editing settings" : "Edit settings");
+
+    const LinkState state = g_editing ? LinkState::Paused : g_dsu.is_transmitting() ? LinkState::Active : LinkState::Idle;
+    if (state != g_shown_state) {
+        g_shown_state = state;
+        InvalidateRect(hwnd, &ACTIVE_RECT, TRUE);
+    }
+}
+
+static void paint_active_indicator(HDC dc) {
+    HBRUSH background = CreateSolidBrush(COLOR_BG);
+    FillRect(dc, &ACTIVE_RECT, background);
+    DeleteObject(background);
+
+    const COLORREF color = g_shown_state == LinkState::Active   ? COLOR_ACTIVE
+                           : g_shown_state == LinkState::Paused ? COLOR_PAUSED
+                                                                : COLOR_DIM_TEXT;
+    const char* text = g_shown_state == LinkState::Active ? "Active" : g_shown_state == LinkState::Paused ? "Paused" : "Idle";
+    const int dot = 10;
+    const int top = (ACTIVE_RECT.top + ACTIVE_RECT.bottom - dot) / 2;
+    HBRUSH brush = CreateSolidBrush(color);
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ old_brush = SelectObject(dc, brush);
+    HGDIOBJ old_pen = SelectObject(dc, pen);
+    Ellipse(dc, ACTIVE_RECT.left, top, ACTIVE_RECT.left + dot, top + dot);
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+
+    RECT label = ACTIVE_RECT;
+    label.left += dot + 6;
+    HGDIOBJ old_font = SelectObject(dc, g_font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextA(dc, text, -1, &label, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    SelectObject(dc, old_font);
+}
+
+static void refresh_settings(HWND hwnd) {
+    AdapterFrame raw, centered, out;
+    bool calibrated[4];
+    {
+        std::lock_guard lock(g_mutex);
+        raw = g_raw;
+        centered = g_centered;
+        out = g_out;
+        for (int p = 0; p < 4; ++p) {
+            calibrated[p] = g_notches[p].valid;
+        }
+    }
+
+    const int calibrating = g_calibrating_port;
+    for (int p = 0; p < 4; ++p) {
+        std::string text = "No controller";
+        if (raw[p].connected) {
+            // Stick convention: neutral is 0, 0, right and up are positive. "game" is what OoT
+            // sees after Wii VC. Fixed-width fields in a monospace font so nothing shifts.
+            int in_game[2];
+            vc_in_game(out[p].stick[0] - 128, out[p].stick[1] - 128, in_game);
+            char buffer[64];
+            std::snprintf(buffer, sizeof(buffer), "Stick %4d,%4d  game %3d,%3d", centered[p].stick[0] - 128, centered[p].stick[1] - 128,
+                          in_game[0], in_game[1]);
+            text = buffer;
+        }
+        set_text(hwnd, ID_PORT_TEXT + p, text);
+        set_text(hwnd, ID_NOTCH_TEXT + p, calibrated[p] ? "Notches: set" : "Notches: none");
+        set_text(hwnd, ID_CALIBRATE + p, calibrating == p ? "Cancel" : "Calibrate");
+    }
+
+    set_text(hwnd, ID_SNAP_VALUE, std::to_string(g_snap_distance));
+    set_text(hwnd, ID_RANGE_START_VALUE, std::to_string(g_range_start));
+    set_text(hwnd, ID_RANGE_END_VALUE, std::to_string(g_range_end));
+    set_text(hwnd, ID_DEAD_ZONE_VALUE, std::to_string(g_dead_zone));
+
+    std::string prompt = "Dolphin gets a neutral controller until you close this window.";
+    if (calibrating >= 0) {
+        const std::string port = std::to_string(calibrating + 1);
+        const int step = g_calibration_step;
+        const std::string progress = " (" + std::to_string(step + 1) + "/" + std::to_string(CALIBRATION_STEPS) + "). B cancels.";
+        if (!raw[calibrating].connected) {
+            prompt = "Port " + port + " calibration: plug in a controller.";
+        } else if (is_neutral_step(step)) {
+            prompt = "Port " + port + ": let go of the stick, press A" + progress;
+        } else {
+            prompt = "Port " + port + ": hold the " + NOTCH_NAMES[notch_of_step(step)] + " notch, press A" + progress;
+        }
+    }
+    set_text(hwnd, ID_PROMPT, prompt);
+    for (const RECT& plot : {STICK_PLOT, GAME_PLOT}) {
+        const RECT with_legend = {plot.left, plot.top, plot.right, plot.bottom + LEGEND_HEIGHT};
+        InvalidateRect(hwnd, &with_legend, FALSE);
+    }
+}
+
+static void fill(HDC dc, const RECT& rect, COLORREF color) {
+    HBRUSH brush = CreateSolidBrush(color);
+    FillRect(dc, &rect, brush);
+    DeleteObject(brush);
+}
+
+static void frame(HDC dc, const RECT& rect, COLORREF color) {
+    HBRUSH brush = CreateSolidBrush(color);
+    FrameRect(dc, &rect, brush);
+    DeleteObject(brush);
+}
+
+// Draws the owner-drawn push buttons and the ESS checkboxes in dark colors.
+static void draw_item(const DRAWITEMSTRUCT& item) {
+    HDC dc = item.hDC;
+    RECT rect = item.rcItem;
+    char text[64];
+    GetWindowTextA(item.hwndItem, text, sizeof(text));
+    SelectObject(dc, g_font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, COLOR_TEXT);
+    FillRect(dc, &rect, g_bg_brush);
+
+    const int id = static_cast<int>(item.CtlID);
+    if (id >= ID_ESS_CHECK && id < ID_ESS_CHECK + 4) {
+        const int size = 14;
+        const int top = (rect.top + rect.bottom - size) / 2;
+        const RECT box = {rect.left, top, rect.left + size, top + size};
+        const bool checked = g_ess[id - ID_ESS_CHECK];
+        fill(dc, box, checked ? COLOR_ACCENT : COLOR_FACE);
+        frame(dc, box, checked ? COLOR_ACCENT : COLOR_BORDER);
+        if (checked) {
+            HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+            HGDIOBJ old_pen = SelectObject(dc, pen);
+            const POINT tick[3] = {{box.left + 3, top + 7}, {box.left + 6, top + 10}, {box.left + 11, top + 4}};
+            Polyline(dc, tick, 3);
+            SelectObject(dc, old_pen);
+            DeleteObject(pen);
+        }
+        RECT label = rect;
+        label.left += size + 6;
+        DrawTextA(dc, text, -1, &label, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    } else {
+        fill(dc, rect, (item.itemState & ODS_SELECTED) ? COLOR_FACE_DOWN : COLOR_FACE);
+        frame(dc, rect, COLOR_BORDER);
+        DrawTextA(dc, text, -1, &rect, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+    }
+}
+
+// Off-screen canvas for one plot and its legend underneath, so the 20 Hz redraw doesn't
+// flicker. w and h are the plot square; the legend area follows below it.
+struct Plot {
+    HDC dc;
+    int w, h;
+    double scale;  // pixels per stick unit
+    int px(double x) const {
+        return w / 2 + static_cast<int>(std::lround(x * scale));
+    }
+    int py(double y) const {
+        return h / 2 - static_cast<int>(std::lround(y * scale));
+    }
+};
+
+template <typename Draw>
+static void draw_plot(HDC target, const RECT& rect, double scale, Draw draw) {
+    Plot plot{CreateCompatibleDC(target), rect.right - rect.left, rect.bottom - rect.top, scale};
+    HBITMAP bitmap = CreateCompatibleBitmap(target, plot.w, plot.h + LEGEND_HEIGHT);
+    HGDIOBJ old_bitmap = SelectObject(plot.dc, bitmap);
+    HGDIOBJ old_pen = SelectObject(plot.dc, GetStockObject(DC_PEN));
+    HGDIOBJ old_brush = SelectObject(plot.dc, GetStockObject(DC_BRUSH));
+    HGDIOBJ old_font = SelectObject(plot.dc, g_font);
+    SetBkMode(plot.dc, TRANSPARENT);
+    const RECT area = {0, 0, plot.w, plot.h};
+    fill(plot.dc, area, COLOR_PLOT_BG);
+    fill(plot.dc, {0, plot.h, plot.w, plot.h + LEGEND_HEIGHT}, COLOR_BG);
+
+    draw(plot);
+
+    frame(plot.dc, area, COLOR_BORDER);
+    BitBlt(target, rect.left, rect.top, plot.w, plot.h + LEGEND_HEIGHT, plot.dc, 0, 0, SRCCOPY);
+    SelectObject(plot.dc, old_font);
+    SelectObject(plot.dc, old_brush);
+    SelectObject(plot.dc, old_pen);
+    SelectObject(plot.dc, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(plot.dc);
+}
+
+static void draw_axes(const Plot& plot) {
+    SetDCPenColor(plot.dc, COLOR_PLOT_AXIS);
+    MoveToEx(plot.dc, 0, plot.h / 2, nullptr);
+    LineTo(plot.dc, plot.w, plot.h / 2);
+    MoveToEx(plot.dc, plot.w / 2, 0, nullptr);
+    LineTo(plot.dc, plot.w / 2, plot.h);
+}
+
+// Octagon through (0, straight) and (corner, corner) in each direction.
+static void draw_gate(const Plot& plot, double straight, double corner, COLORREF color) {
+    const double points[NOTCH_COUNT][2] = {{0, straight},  {corner, corner},   {straight, 0},  {corner, -corner},
+                                           {0, -straight}, {-corner, -corner}, {-straight, 0}, {-corner, corner}};
+    POINT gate[NOTCH_COUNT + 1];
+    for (int i = 0; i <= NOTCH_COUNT; ++i) {
+        gate[i] = {plot.px(points[i % NOTCH_COUNT][0]), plot.py(points[i % NOTCH_COUNT][1])};
+    }
+    SetDCPenColor(plot.dc, color);
+    Polyline(plot.dc, gate, NOTCH_COUNT + 1);
+}
+
+static void draw_dot(const Plot& plot, int port, double x, double y, bool highlight) {
+    SetDCPenColor(plot.dc, COLOR_PLOT_BG);
+    SetDCBrushColor(plot.dc, highlight ? COLOR_DOT_IN_RANGE : COLOR_TEXT);
+    const int cx = plot.px(x), cy = plot.py(y);
+    Ellipse(plot.dc, cx - 4, cy - 4, cx + 5, cy + 5);
+    const std::string label = std::to_string(port + 1);
+    SetTextColor(plot.dc, COLOR_TEXT);
+    TextOutA(plot.dc, cx + 6, cy - 16, label.c_str(), static_cast<int>(label.size()));
+}
+
+// Legend under the plot: one colored swatch (or line) and label per row.
+struct LegendRow {
+    COLORREF color;
+    bool line;
+    std::string text;
+};
+
+static void draw_legend(const Plot& plot, const std::vector<LegendRow>& rows) {
+    SetTextColor(plot.dc, COLOR_TEXT);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const int y = plot.h + 6 + 18 * static_cast<int>(i);
+        if (rows[i].line) {
+            fill(plot.dc, {2, y + 7, 12, y + 9}, rows[i].color);
+        } else {
+            fill(plot.dc, {2, y + 3, 12, y + 13}, rows[i].color);
+        }
+        TextOutA(plot.dc, 18, y, rows[i].text.c_str(), static_cast<int>(rows[i].text.size()));
+    }
+}
+
+static void paint_plots(HDC target) {
+    AdapterFrame raw, centered, calibrated, out;
+    {
+        std::lock_guard lock(g_mutex);
+        raw = g_raw;
+        centered = g_centered;
+        calibrated = g_calibrated;
+        out = g_out;
+    }
+    const int start = g_ess_start, end = g_ess_end;
+
+    // Physical stick: the dead zone and ESS range to scale, inside the Gamecube gate.
+    draw_plot(target, STICK_PLOT, STICK_PLOT_SCALE, [&](const Plot& plot) {
+        auto disk = [&](double r, COLORREF color) {
+            SetDCPenColor(plot.dc, color);
+            SetDCBrushColor(plot.dc, color);
+            Ellipse(plot.dc, plot.px(-r), plot.py(r), plot.px(r) + 1, plot.py(-r) + 1);
+        };
+        disk(end, COLOR_ESS_RANGE);
+        disk(start, COLOR_DEAD_ZONE);
+        if (g_dead_zone_distance > 0) {
+            disk(g_dead_zone_distance, COLOR_SOFTWARE_DEAD_ZONE);
+        }
+        draw_axes(plot);
+        draw_gate(plot, 105, 75, COLOR_BORDER);
+
+        // While calibrating, a ring around where the stick should go for the current step:
+        // the ideal notch, or the center for a neutral step.
+        if (g_calibrating_port >= 0) {
+            const int step = g_calibration_step;
+            const int8_t* target = is_neutral_step(step) ? nullptr : IDEAL_NOTCHES[notch_of_step(step)];
+            const double tx = target ? target[0] : 0, ty = target ? target[1] : 0, r = 12;
+            HPEN pen = CreatePen(PS_SOLID, 2, COLOR_CALIBRATION_TARGET);
+            HGDIOBJ old_pen = SelectObject(plot.dc, pen);
+            HGDIOBJ old_brush = SelectObject(plot.dc, GetStockObject(NULL_BRUSH));
+            Ellipse(plot.dc, plot.px(tx - r), plot.py(ty + r), plot.px(tx + r) + 1, plot.py(ty - r) + 1);
+            SelectObject(plot.dc, old_brush);
+            SelectObject(plot.dc, old_pen);
+            DeleteObject(pen);
+        }
+
+        for (int p = 0; p < 4; ++p) {
+            if (!raw[p].connected) {
+                continue;
+            }
+            // The stick after notch calibration, so it lines up with the ESS range. A port that is
+            // calibrating shows its raw stick instead, to match the green target ring.
+            const GCPortState& shown = p == g_calibrating_port ? centered[p] : calibrated[p];
+            const int x = shown.stick[0] - 128, y = shown.stick[1] - 128;
+            const double r = std::sqrt(static_cast<double>(x * x + y * y));
+            draw_dot(plot, p, x, y, r >= start && r <= end);
+        }
+        draw_legend(plot, {{COLOR_ESS_RANGE, false,
+                            "ESS range " + std::to_string(g_range_start) + " to " + std::to_string(g_range_end) + " in game"},
+                           {COLOR_DEAD_ZONE, false, "Game dead zone"},
+                           {COLOR_SOFTWARE_DEAD_ZONE, false, "Software dead zone (reads 0, 0)"}});
+    });
+
+    // In game: OoT's own zones in the values it receives from VC. ESS is everything within 20
+    // of the dead zone square, so a rounded square; full speed is the same shape at 60.
+    draw_plot(target, GAME_PLOT, GAME_PLOT_SCALE, [&](const Plot& plot) {
+        auto rounded_square = [&](double half, double radius, COLORREF color, bool filled) {
+            SetDCPenColor(plot.dc, color);
+            SetDCBrushColor(plot.dc, color);
+            SelectObject(plot.dc, GetStockObject(filled ? DC_BRUSH : NULL_BRUSH));
+            const int diameter = static_cast<int>(std::lround(2 * radius * plot.scale));
+            RoundRect(plot.dc, plot.px(-half), plot.py(half), plot.px(half) + 1, plot.py(-half) + 1, diameter, diameter);
+            SelectObject(plot.dc, GetStockObject(DC_BRUSH));
+        };
+        // Cell edges: dead zone covers 0 to 7, ESS reaches 26, full speed starts at 67.
+        rounded_square(26.5, 19.5, COLOR_ESS_RANGE, true);
+        rounded_square(7.5, 0, COLOR_DEAD_ZONE, true);
+        draw_axes(plot);
+        rounded_square(67, 60, COLOR_FULL_SPEED, false);
+        draw_gate(plot, 80, 70, COLOR_BORDER);
+        for (int p = 0; p < 4; ++p) {
+            if (!raw[p].connected) {
+                continue;
+            }
+            int in_game[2];
+            vc_in_game(out[p].stick[0] - 128, out[p].stick[1] - 128, in_game);
+            draw_dot(plot, p, in_game[0], in_game[1], oot_zone(in_game[0], in_game[1]) == OotZone::Ess);
+        }
+        draw_legend(plot, {{COLOR_ESS_RANGE, false, "ESS (turn in place)"},
+                           {COLOR_DEAD_ZONE, false, "Dead zone"},
+                           {COLOR_FULL_SPEED, true, "Full speed"}});
+    });
+}
+
+static HWND add_control(HWND parent, const char* cls, const char* text, DWORD style, int x, int y, int w, int h, int id) {
+    HWND control = CreateWindowA(cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
+    SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    return control;
+}
+
+static void on_settings_command(HWND hwnd, int id) {
+    if (id == ID_DONE) {
+        DestroyWindow(hwnd);
+        return;
+    }
+    if (id >= ID_ESS_CHECK && id < ID_ESS_CHECK + 4) {
+        g_ess[id - ID_ESS_CHECK] = !g_ess[id - ID_ESS_CHECK];
+        InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
+    } else if (id >= ID_CALIBRATE && id < ID_CALIBRATE + 4) {
+        const int port = id - ID_CALIBRATE;
+        if (g_calibrating_port == port) {
+            g_calibrating_port = -1;
+        } else {
+            g_calibration_step = 0;
+            g_calibrating_port = port;
+        }
+    } else if (id == ID_SNAP_MINUS || id == ID_SNAP_PLUS) {
+        const int step = id == ID_SNAP_PLUS ? 1 : -1;
+        g_snap_distance = std::clamp(g_snap_distance + step, 0, MAX_SNAP_DISTANCE);
+        save_snap_distance();
+    } else if (id == ID_RANGE_START_MINUS || id == ID_RANGE_START_PLUS) {
+        const int step = id == ID_RANGE_START_PLUS ? 1 : -1;
+        g_range_start = std::clamp(g_range_start + step, g_dead_zone + 1, g_range_end - 1);
+        update_range_distances();
+        save_ess_range();
+    } else if (id == ID_RANGE_END_MINUS || id == ID_RANGE_END_PLUS) {
+        const int step = id == ID_RANGE_END_PLUS ? 1 : -1;
+        g_range_end = std::clamp(g_range_end + step, g_range_start + 1, max_in_game_end());
+        update_range_distances();
+        save_ess_range();
+    } else if (id == ID_DEAD_ZONE_MINUS || id == ID_DEAD_ZONE_PLUS) {
+        const int step = id == ID_DEAD_ZONE_PLUS ? 1 : -1;
+        g_dead_zone = std::clamp(g_dead_zone + step, 0, g_range_start - 1);
+        g_dead_zone_distance = physical_dead_zone(g_dead_zone);
+        save_dead_zone();
+    } else if (id == ID_RANGE_DEFAULT) {
+        g_range_start = std::max(ESS_IN_GAME_START, g_dead_zone + 1);
+        g_range_end = ESS_IN_GAME_END;
+        update_range_distances();
+        save_ess_range();
+    }
+    refresh_settings(hwnd);
+}
+
+// Messages both windows handle the same way: dark static text and owner-drawn buttons.
+static bool handle_dark_controls(UINT msg, WPARAM wparam, LPARAM lparam, LRESULT& result) {
+    if (msg == WM_CTLCOLORSTATIC) {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lparam));
+        const bool dim = id == ID_SNAP_HINT || id == ID_DEAD_ZONE_HINT || id == ID_MAIN_HINT || id == ID_ABOUT_LEGAL;
+        SetTextColor(dc, dim ? COLOR_DIM_TEXT : COLOR_TEXT);
+        SetBkColor(dc, COLOR_BG);
+        result = reinterpret_cast<LRESULT>(g_bg_brush);
+        return true;
+    }
+    if (msg == WM_DRAWITEM) {
+        draw_item(*reinterpret_cast<const DRAWITEMSTRUCT*>(lparam));
+        result = TRUE;
+        return true;
+    }
+    return false;
+}
+
+static void use_dark_title_bar(HWND hwnd) {
+    const BOOL dark = TRUE;
+    DwmSetWindowAttribute(hwnd, DWM_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+}
+
+static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    LRESULT result;
+    if (handle_dark_controls(msg, wparam, lparam, result)) {
+        return result;
+    }
+
+    switch (msg) {
+    case WM_CREATE:
+        use_dark_title_bar(hwnd);
+        for (int p = 0; p < 4; ++p) {
+            const int y = 10 + p * 30;
+            const std::string label = "Port " + std::to_string(p + 1) + " ESS";
+            add_control(hwnd, "BUTTON", label.c_str(), BS_OWNERDRAW, 10, y, 85, 22, ID_ESS_CHECK + p);
+            add_control(hwnd, "BUTTON", "Calibrate", BS_OWNERDRAW, 100, y, 75, 22, ID_CALIBRATE + p);
+            HWND readout = add_control(hwnd, "STATIC", "", 0, 185, y + 3, 240, 18, ID_PORT_TEXT + p);
+            SendMessageA(readout, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
+            add_control(hwnd, "STATIC", "", 0, 432, y + 3, 100, 18, ID_NOTCH_TEXT + p);
+        }
+        add_control(hwnd, "STATIC", "Notch snap distance", 0, 10, 137, 115, 18, ID_SNAP_LABEL);
+        add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, 130, 134, 24, 22, ID_SNAP_MINUS);
+        add_control(hwnd, "STATIC", "", SS_CENTER, 156, 137, 26, 18, ID_SNAP_VALUE);
+        add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, 184, 134, 24, 22, ID_SNAP_PLUS);
+        add_control(hwnd, "STATIC", "units (0 = off, max 10)", 0, 216, 137, 200, 18, ID_SNAP_HINT);
+        add_control(hwnd, "STATIC", "ESS range start", 0, 10, 167, 80, 18, ID_RANGE_LABEL);
+        add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, 95, 164, 24, 22, ID_RANGE_START_MINUS);
+        add_control(hwnd, "STATIC", "", SS_CENTER, 121, 167, 26, 18, ID_RANGE_START_VALUE);
+        add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, 149, 164, 24, 22, ID_RANGE_START_PLUS);
+        add_control(hwnd, "STATIC", "end", 0, 188, 167, 22, 18, ID_RANGE_END_LABEL);
+        add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, 213, 164, 24, 22, ID_RANGE_END_MINUS);
+        add_control(hwnd, "STATIC", "", SS_CENTER, 239, 167, 26, 18, ID_RANGE_END_VALUE);
+        add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, 267, 164, 24, 22, ID_RANGE_END_PLUS);
+        add_control(hwnd, "BUTTON", "Default", BS_OWNERDRAW, 306, 164, 60, 22, ID_RANGE_DEFAULT);
+        add_control(hwnd, "STATIC", "Dead zone", 0, 10, 197, 80, 18, ID_DEAD_ZONE_LABEL);
+        add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, 95, 194, 24, 22, ID_DEAD_ZONE_MINUS);
+        add_control(hwnd, "STATIC", "", SS_CENTER, 121, 197, 26, 18, ID_DEAD_ZONE_VALUE);
+        add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, 149, 194, 24, 22, ID_DEAD_ZONE_PLUS);
+        add_control(hwnd, "STATIC", "in game, rests at exactly 0, 0 (0 = off, below range start)", 0, 181, 197, 300, 18, ID_DEAD_ZONE_HINT);
+        add_control(hwnd, "STATIC", "Your stick", 0, STICK_PLOT.left, STICK_PLOT.top - 20, 200, 18, ID_STICK_PLOT_TITLE);
+        add_control(hwnd, "STATIC", "In game (OoT on Wii VC)", 0, GAME_PLOT.left, GAME_PLOT.top - 20, 200, 18, ID_GAME_PLOT_TITLE);
+        add_control(hwnd, "STATIC", "", 0, 10, STICK_PLOT.bottom + LEGEND_HEIGHT + 27, 410, 18, ID_PROMPT);
+        add_control(hwnd, "BUTTON", "Done", BS_OWNERDRAW, 432, STICK_PLOT.bottom + LEGEND_HEIGHT + 23, 100, 24, ID_DONE);
+        refresh_settings(hwnd);
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        paint_plots(dc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_COMMAND: {
+        // Owner-drawn buttons report fast second clicks as double clicks.
+        const int code = HIWORD(wparam);
+        if (code == BN_CLICKED || code == BN_DOUBLECLICKED) {
+            on_settings_command(hwnd, LOWORD(wparam));
+        }
+        return 0;
+    }
+    case WM_DESTROY:
+        // Closing the settings window ends editing: real input goes back to Dolphin.
+        g_calibrating_port = -1;
+        g_editing = false;
+        g_settings_window = nullptr;
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+static void open_settings(HWND owner) {
+    if (g_settings_window) {
+        SetForegroundWindow(g_settings_window);
+        return;
+    }
+    RECT rect = {0, 0, 542, STICK_PLOT.bottom + LEGEND_HEIGHT + 57};
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    AdjustWindowRect(&rect, style, FALSE);
+    g_editing = true;
+    g_settings_window = CreateWindowA(SETTINGS_CLASS, "Software ESS Adapter settings", style, CW_USEDEFAULT, CW_USEDEFAULT,
+                                      rect.right - rect.left, rect.bottom - rect.top, owner, nullptr, GetModuleHandleA(nullptr), nullptr);
+    ShowWindow(g_settings_window, SW_SHOW);
+}
+
+// A text resource from assets/resources.rc, with Windows line endings.
+static std::string load_text_resource(int id) {
+    HRSRC resource = FindResourceA(nullptr, MAKEINTRESOURCEA(id), MAKEINTRESOURCEA(10));  // RT_RCDATA
+    HGLOBAL loaded = resource ? LoadResource(nullptr, resource) : nullptr;
+    const char* data = loaded ? static_cast<const char*>(LockResource(loaded)) : nullptr;
+    if (!data) {
+        return "";
+    }
+    const std::string text(data, SizeofResource(nullptr, resource));
+    std::string crlf;
+    for (char c : text) {
+        if (c == '\n') {
+            crlf += '\r';
+        }
+        if (c != '\r') {
+            crlf += c;
+        }
+    }
+    return crlf;
+}
+
+// Writes the license texts built into the exe to a temporary text file and opens it in the
+// default text editor.
+static void open_licenses(HWND hwnd) {
+    char folder[MAX_PATH];
+    GetTempPathA(MAX_PATH, folder);
+    const std::string path = std::string(folder) + "Software ESS Adapter licenses.txt";
+    const std::string text = load_text_resource(GPL_TEXT) + "\r\n\r\n" + load_text_resource(THIRD_PARTY_TEXT);
+    if (FILE* file = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(text.data(), 1, text.size(), file);
+        std::fclose(file);
+        ShellExecuteA(hwnd, "open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+// About window: name and version, credits, the GPL's no-warranty notice, the source link, and a
+// way to read the licenses. GPLv3 asks interactive programs to show this, and it keeps the release
+// zip free of separate license files.
+static LRESULT CALLBACK about_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    LRESULT result;
+    if (handle_dark_controls(msg, wparam, lparam, result)) {
+        return result;
+    }
+
+    switch (msg) {
+    case WM_CREATE: {
+        use_dark_title_bar(hwnd);
+        HWND title = add_control(hwnd, "STATIC", "Software ESS Adapter v" APP_VERSION, 0, 14, 14, 330, 24, ID_ABOUT_TITLE);
+        SendMessageA(title, WM_SETFONT, reinterpret_cast<WPARAM>(g_title_font), TRUE);
+        add_control(hwnd, "STATIC", "Created by Torje Amundsen\r\nESS map from ESS-Adapter by Skuzee", 0, 14, 44, 330, 34,
+                    ID_ABOUT_CREDITS);
+        add_control(hwnd, "STATIC", "Free software under the GNU GPL v3, with no warranty.", 0, 14, 88, 330, 18, ID_ABOUT_LEGAL);
+        add_control(hwnd, "BUTTON", "Source code", BS_OWNERDRAW, 14, 122, 100, 24, ID_ABOUT_SOURCE);
+        add_control(hwnd, "BUTTON", "Licenses", BS_OWNERDRAW, 122, 122, 90, 24, ID_ABOUT_LICENSES);
+        add_control(hwnd, "BUTTON", "Close", BS_OWNERDRAW, 254, 122, 90, 24, ID_ABOUT_CLOSE);
+        return 0;
+    }
+    case WM_COMMAND: {
+        const int code = HIWORD(wparam);
+        if (code != BN_CLICKED && code != BN_DOUBLECLICKED) {
+            return 0;
+        }
+        switch (LOWORD(wparam)) {
+        case ID_ABOUT_SOURCE:
+            ShellExecuteA(hwnd, "open", SOURCE_URL, nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case ID_ABOUT_LICENSES:
+            open_licenses(hwnd);
+            break;
+        case ID_ABOUT_CLOSE:
+            DestroyWindow(hwnd);
+            break;
+        }
+        return 0;
+    }
+    case WM_DESTROY:
+        g_about_window = nullptr;
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+static void open_about(HWND owner) {
+    if (g_about_window) {
+        SetForegroundWindow(g_about_window);
+        return;
+    }
+    RECT rect = {0, 0, 358, 160};
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    AdjustWindowRect(&rect, style, FALSE);
+    g_about_window = CreateWindowA(ABOUT_CLASS, "About Software ESS Adapter", style, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left,
+                                   rect.bottom - rect.top, owner, nullptr, GetModuleHandleA(nullptr), nullptr);
+    ShowWindow(g_about_window, SW_SHOW);
+}
+
+static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    LRESULT result;
+    if (handle_dark_controls(msg, wparam, lparam, result)) {
+        return result;
+    }
+
+    switch (msg) {
+    case WM_CREATE:
+        use_dark_title_bar(hwnd);
+        add_control(hwnd, "STATIC", "", 0, 10, 10, 340, 18, ID_ADAPTER_STATUS);
+        add_control(hwnd, "STATIC", g_dsu.last_error().c_str(), 0, 10, 30, 340, 18, ID_DSU_STATUS);
+        for (int p = 0; p < 4; ++p) {
+            add_control(hwnd, "STATIC", "", 0, 10, 60 + p * 20, 340, 18, ID_MAIN_PORT + p);
+        }
+        add_control(hwnd, "BUTTON", "Edit settings", BS_OWNERDRAW, 10, 150, 120, 24, ID_EDIT);
+        add_control(hwnd, "STATIC", "Stick values only show while editing.", 0, 140, 154, 205, 18, ID_MAIN_HINT);
+        add_control(hwnd, "BUTTON", "About", BS_OWNERDRAW, 350, 150, 70, 24, ID_ABOUT);
+        refresh_main(hwnd);
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        paint_active_indicator(dc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_COMMAND: {
+        const int code = HIWORD(wparam);
+        if (code == BN_CLICKED || code == BN_DOUBLECLICKED) {
+            if (LOWORD(wparam) == ID_EDIT) {
+                open_settings(hwnd);
+            } else if (LOWORD(wparam) == ID_ABOUT) {
+                open_about(hwnd);
+            }
+        }
+        return 0;
+    }
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
+    load_settings();
+    g_dsu.start(DsuServer::DEFAULT_PORT);
+    std::thread bridge(bridge_loop);
+
+    g_bg_brush = CreateSolidBrush(COLOR_BG);
+    g_font = CreateFontA(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    g_mono_font = CreateFontA(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+    g_title_font = CreateFontA(-17, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+
+    // App icon from assets/resources.rc, at the system's large and small icon sizes.
+    auto load_icon = [&](int size_metric) {
+        const int size = GetSystemMetrics(size_metric);
+        return static_cast<HICON>(LoadImageA(instance, MAKEINTRESOURCEA(APP_ICON), IMAGE_ICON, size, size, 0));
+    };
+
+    WNDCLASSEXA wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = instance;
+    wc.hIcon = load_icon(SM_CXICON);
+    wc.hIconSm = load_icon(SM_CXSMICON);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = g_bg_brush;
+    wc.lpfnWndProc = main_proc;
+    wc.lpszClassName = "SoftwareESSAdapter";
+    RegisterClassExA(&wc);
+    wc.lpfnWndProc = settings_proc;
+    wc.lpszClassName = SETTINGS_CLASS;
+    RegisterClassExA(&wc);
+    wc.lpfnWndProc = about_proc;
+    wc.lpszClassName = ABOUT_CLASS;
+    RegisterClassExA(&wc);
+
+    RECT rect = {0, 0, 430, 184};
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    AdjustWindowRect(&rect, style, FALSE);
+    HWND hwnd = CreateWindowA("SoftwareESSAdapter", "Software ESS Adapter", style, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left,
+                              rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
+    ShowWindow(hwnd, show);
+
+    // Refresh the windows at 60 Hz. SetTimer only ticks every 15.6 ms or so, which lands nowhere
+    // near 60, so wait on a high-resolution waitable timer scheduled against the clock instead.
+    // Without high-resolution support (before Windows 10 1803) this falls back to a normal one.
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer) {
+        timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    }
+    LARGE_INTEGER frequency, now;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    const LONGLONG period = frequency.QuadPart / 60;
+    LONGLONG next_frame = now.QuadPart + period;
+    bool quit = false;
+    while (!quit) {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - next_frame > period) {
+            next_frame = now.QuadPart;  // fell behind, don't try to catch up
+        }
+        LARGE_INTEGER due;  // negative = relative, in 100 ns units
+        due.QuadPart = -std::max<LONGLONG>(0, (next_frame - now.QuadPart) * 10000000 / frequency.QuadPart);
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+
+        if (MsgWaitForMultipleObjects(1, &timer, FALSE, INFINITE, QS_ALLINPUT) == WAIT_OBJECT_0) {
+            refresh_main(hwnd);
+            if (g_settings_window) {
+                refresh_settings(g_settings_window);
+            }
+            next_frame += period;
+        }
+
+        MSG msg;
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                quit = true;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+    }
+    CloseHandle(timer);
+
+    g_running = false;
+    bridge.join();
+    g_dsu.stop();
+    DeleteObject(g_font);
+    DeleteObject(g_mono_font);
+    DeleteObject(g_title_font);
+    DeleteObject(g_bg_brush);
+    return 0;
+}
