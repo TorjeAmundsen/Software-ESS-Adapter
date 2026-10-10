@@ -8,7 +8,8 @@
 
 const char* const NOTCH_NAMES[NOTCH_COUNT] = {"Up", "Up-Right", "Right", "Down-Right", "Down", "Down-Left", "Left", "Up-Left"};
 
-const int8_t IDEAL_NOTCHES[NOTCH_COUNT][2] = {{0, 105}, {75, 75}, {105, 0}, {75, -75}, {0, -105}, {-75, -75}, {-105, 0}, {-75, 75}};
+static constexpr int8_t S = GATE_STRAIGHT, D = GATE_DIAGONAL;
+const int8_t IDEAL_NOTCHES[NOTCH_COUNT][2] = {{0, S}, {D, D}, {S, 0}, {D, -D}, {0, -S}, {-D, -D}, {-S, 0}, {-D, D}};
 
 void set_neutral_samples(NotchCalibration& calibration, const uint8_t samples[NOTCH_COUNT][2]) {
     for (int axis = 0; axis < 2; ++axis) {

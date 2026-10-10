@@ -127,7 +127,7 @@ DsuServer::~DsuServer() {
 bool DsuServer::start(uint16_t port) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        error_ = "WSAStartup failed";
+        error_ = "Networking failed to start, so Dolphin can't connect. Restart the program.";
         return false;
     }
     winsock_started_ = true;
@@ -138,7 +138,8 @@ bool DsuServer::start(uint16_t port) {
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (socket_ == INVALID_SOCKET || bind(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        error_ = "Cannot listen on UDP port " + std::to_string(port) + " (another DSU server running?)";
+        error_ = "Port " + std::to_string(port) +
+                 " is already in use, so Dolphin can't connect. Close other DSU programs, then restart this one.";
         stop();
         return false;
     }
@@ -198,10 +199,10 @@ void DsuServer::handle_packet(const uint8_t* data, int size, const sockaddr_in& 
     } else if (header.message_type == MSG_PORT_INFO && body_size >= 4) {
         int32_t count;
         std::memcpy(&count, body, 4);
-        count = std::clamp(count, 0, std::min(4, body_size - 4));
+        count = std::clamp(count, 0, std::min(PORT_COUNT, body_size - 4));
         for (int i = 0; i < count; ++i) {
             const int pad = body[4 + i];
-            if (pad >= 4) {
+            if (pad >= PORT_COUNT) {
                 continue;
             }
             PortInfo msg = {};
@@ -226,7 +227,7 @@ void DsuServer::handle_packet(const uint8_t* data, int size, const sockaddr_in& 
             clients_.push_back({from, {}});
             it = clients_.end() - 1;
         }
-        for (int pad = 0; pad < 4; ++pad) {
+        for (int pad = 0; pad < PORT_COUNT; ++pad) {
             const bool by_id = (flags & 1) && pad_id == pad;
             const bool by_mac = (flags & 2) && std::memcmp(mac, port_shared(pad, true).mac, 6) == 0;
             if (flags == 0 || by_id || by_mac) {
@@ -249,7 +250,7 @@ void DsuServer::publish(const AdapterFrame& frame) {
                                   }),
                    clients_.end());
 
-    for (int pad = 0; pad < 4; ++pad) {
+    for (int pad = 0; pad < PORT_COUNT; ++pad) {
         const GCPortState& gc = frame[pad];
         if (!gc.connected) {
             continue;

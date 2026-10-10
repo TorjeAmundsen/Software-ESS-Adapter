@@ -30,9 +30,13 @@ void vc_in_game(int gc_x, int gc_y, int in_game[2]);
 // Same, for one axis with the other at 0.
 int vc_in_game(int gc_offset);
 
-// How OoT reads an in-game stick value: a per-axis dead zone of 7, then the magnitude of
-// what is left. Below 20 Link turns in place (ESS), from 20 he walks
-// (PadUtils_UpdateRelXY in libu64/pad.c, Player_CalcSpeedAndYawFromControlStick in z_player.c).
+// How OoT reads an in-game stick value: a per-axis dead zone of 7, then up to 60 more per axis, and
+// the magnitude of that. Below 20 Link turns in place (ESS), from 20 he walks, and at 60 he is at
+// full speed (PadUtils_UpdateRelXY in libu64/pad.c, Player_CalcSpeedAndYawFromControlStick in
+// z_player.c).
+constexpr int OOT_DEAD_ZONE = 7;
+constexpr int OOT_REL_MAX = 60;
+constexpr int OOT_WALK_MAGNITUDE = 20;
 enum class OotZone { DeadZone, Ess, Walk };
 OotZone oot_zone(int x, int y);
 

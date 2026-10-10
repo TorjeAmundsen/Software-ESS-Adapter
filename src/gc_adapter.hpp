@@ -13,6 +13,8 @@
 struct libusb_context;
 struct libusb_device_handle;
 
+constexpr int PORT_COUNT = 4;  // controller ports on the adapter
+
 struct GCPortState {
     bool connected = false;
     uint8_t buttons1 = 0;  // A B X Y Left Right Down Up (bit 0..7)
@@ -22,7 +24,7 @@ struct GCPortState {
     uint8_t trigger[2] = {0, 0};  // L, R
 };
 
-using AdapterFrame = std::array<GCPortState, 4>;
+using AdapterFrame = std::array<GCPortState, PORT_COUNT>;
 
 class GCAdapter {
 public:

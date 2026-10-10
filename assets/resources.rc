@@ -1,7 +1,8 @@
-// App icon, made from icon.svg. The id matches APP_ICON in src/main.cpp. Windows Explorer shows
-// the first icon in the exe, so keep this one first.
-1 ICON "icon.ico"
+#include "../src/resource.h"
 
-// License texts shown in the About window. The ids match GPL_TEXT and THIRD_PARTY_TEXT in src/main.cpp.
-2 RCDATA "../LICENSE.md"
-3 RCDATA "licenses/third-party.txt"
+// App icon, made from icon.svg. Keep it first: Windows Explorer shows the first icon in the exe.
+APP_ICON ICON "icon.ico"
+
+// License texts shown from the About window.
+GPL_TEXT RCDATA "../LICENSE.md"
+THIRD_PARTY_TEXT RCDATA "licenses/third-party.txt"

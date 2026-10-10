@@ -19,6 +19,7 @@
 #include "ess.hpp"
 #include "ess_range.hpp"
 #include "notch.hpp"
+#include "stick.hpp"
 
 static int failures = 0;
 #define CHECK(cond)                                             \
@@ -92,7 +93,7 @@ static void test_make_calibration() {
     CHECK(in_neutral_range(cal, inside));
     CHECK(!in_neutral_range(cal, left_of));
     CHECK(!in_neutral_range(cal, above));
-    CHECK(!in_neutral_range(NotchCalibration{}, inside));  // uncalibrated ports have no range
+    CHECK(!in_neutral_range(NotchCalibration{}, inside));  // without calibrated notches there is no range
 }
 
 static void test_notch_warp_and_snap() {
@@ -139,7 +140,7 @@ static void test_notch_warp_and_snap() {
     }
     CHECK(biggest_jump <= 3);
 
-    // Snapping works on the warped stick, against the ideal notches, and only for calibrated ports.
+    // Snapping works on the warped stick, against the ideal notches, and only with calibrated notches.
     auto snap = [&](int x, int y, int distance, bool valid = true) {
         NotchCalibration c = cal;
         c.valid = valid;
@@ -163,8 +164,10 @@ static void test_notch_warp_and_snap() {
 static int in_game(int distance, int start, int end, int direction) {
     const int dx[4] = {1, 0, -1, 0}, dy[4] = {0, 1, 0, -1};
     uint8_t s[2] = {static_cast<uint8_t>(128 + dx[direction] * distance), static_cast<uint8_t>(128 + dy[direction] * distance)};
-    remap_ess_range(s, start, end);
-    invert_vc_gc(s);
+    StickSettings settings;
+    settings.range_start = start;
+    settings.range_end = end;
+    process_stick(s, NotchCalibration{}, settings);
     // VC treats x and y the same way, so read whichever axis is in use.
     const int axis = dx[direction] != 0 ? 0 : 1;
     return std::abs(vc_in_game(s[axis] - 128));
@@ -294,9 +297,11 @@ static void test_ess_range() {
     // and none of ESS; and with the default range, N = 2 zeroes everything that reads 2 or less.
     auto pipeline = [](int x, int y, int start, int end, int dead_zone, int game[2]) {
         uint8_t s[2] = {static_cast<uint8_t>(128 + x), static_cast<uint8_t>(128 + y)};
-        remap_ess_range(s, start, end);
-        apply_dead_zone(s, dead_zone_after_range(dead_zone, start));
-        invert_vc_gc(s);
+        StickSettings settings;
+        settings.range_start = start;
+        settings.range_end = end;
+        settings.dead_zone_distance = dead_zone;
+        process_stick(s, NotchCalibration{}, settings);
         vc_in_game(s[0] - 128, s[1] - 128, game);
     };
     for (const int range_start : {3, 9, 15, 20}) {

@@ -46,7 +46,7 @@ public:
 private:
     struct Client {
         sockaddr_in addr;
-        std::chrono::steady_clock::time_point subscribed_until[4];
+        std::chrono::steady_clock::time_point subscribed_until[PORT_COUNT];
     };
 
     void receive_loop();
@@ -64,5 +64,5 @@ private:
     std::mutex mutex_;  // guards everything below
     std::vector<Client> clients_;
     AdapterFrame frame_{};
-    uint32_t packet_counter_[4] = {};
+    uint32_t packet_counter_[PORT_COUNT] = {};
 };

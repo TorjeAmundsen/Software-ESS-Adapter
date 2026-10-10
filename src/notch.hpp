@@ -12,11 +12,13 @@
 constexpr int NOTCH_COUNT = 8;
 extern const char* const NOTCH_NAMES[NOTCH_COUNT];
 
-// Perfect notches at the edge of the Gamecube range the ESS map expects:
-// 105 straight, 75 per axis in the corners.
+// The Gamecube stick range the ESS map expects: 105 straight, 75 per axis in the corners. The
+// perfect notches sit exactly there.
+constexpr int GATE_STRAIGHT = 105;
+constexpr int GATE_DIAGONAL = 75;
 extern const int8_t IDEAL_NOTCHES[NOTCH_COUNT][2];
 
-constexpr int MAX_SNAP_DISTANCE = 10;
+constexpr int MAX_SNAP_DISTANCE = 5;
 constexpr int DEFAULT_SNAP_DISTANCE = 0;
 
 // Calibration alternates notches and neutral: Up, Neutral, Up-Right, Neutral, ... Up-Left,

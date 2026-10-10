@@ -7,7 +7,7 @@ out/
 *.zip
 
 # Personal settings and calibration the program writes next to the exe
-/Software ESS Adapter.ini
+/Software ESS Adapter settings.ini
 /ess-dolphin-bridge.ini
 
 # Editor and tool files

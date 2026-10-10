@@ -18,7 +18,7 @@ jobs:
         run: ./build.ps1
 
       - name: Build tests
-        run: cmake --build build --target bridge-tests
+        run: cmake --build build/msvc --target bridge-tests
 
       - name: Run tests
-        run: ./build/bridge-tests.exe
+        run: ./build/msvc/bridge-tests.exe

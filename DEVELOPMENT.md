@@ -21,14 +21,16 @@ You need CMake 3.20+, Ninja, and a C++17 compiler on PATH. Either works:
 .\build.ps1
 ```
 
-This builds the program and writes `dist/software-ess-adapter.zip` with the exe and the Dolphin profile. The exe has the C++ runtime built in, so it only needs DLLs that come with Windows.
+This builds the program in `build/msvc` or `build/mingw`, depending on the compiler (a separate folder each, so switching compilers just works), and writes `dist/software-ess-adapter.zip` with the exe and the Dolphin profile. The exe has the C++ runtime built in, so it only needs DLLs that come with Windows.
 
 To run the tests:
 
 ```
-cmake --build build --target bridge-tests
-.\build\bridge-tests.exe
+cmake --build build/mingw --target bridge-tests
+.\build\mingw\bridge-tests.exe
 ```
+
+With MSVC, use `build/msvc` instead.
 
 CMake downloads libusb 1.0.27 and compiles its Windows sources directly, since libusb has no CMake build. libusb only ships a `config.h` for MSVC, so `cmake/libusb-mingw/config.h` provides the same settings for MinGW. To build offline, point CMake at any libusb checkout, for example Dolphin's, with `-DFETCHCONTENT_SOURCE_DIR_LIBUSB="<dolphin>/Externals/libusb/libusb"`.
 
@@ -60,8 +62,10 @@ The style is in `.clang-format`: 4-space indents, 140-column lines, and braces o
 - `src/gc_adapter.cpp` reads the adapter with libusb, using the same protocol as Dolphin's `GCAdapter.cpp`.
 - `src/dsu_server.cpp` is the UDP server, with packet layouts from Dolphin's `DualShockUDPProto.h`.
 - `src/ess_range.cpp` has the ESS range remap, the software dead zone, the Wii VC stick mapping (ported from `generate-map.py` in ESS-Adapter), and OoT's dead zone and ESS rules (`PadUtils_UpdateRelXY` and `Player_CalcSpeedAndYawFromControlStick` in the OoT decomp).
+- `src/stick.cpp` has `process_stick`: the main stick's path from the centered stick to what goes to Dolphin (notch warp, snapping, ESS range, software dead zone, ESS map). The bridge loop and the tests both call it.
 - `src/notch.cpp` has notch calibration, the notch warp, and snapping. The warp splits the stick into 8 slices between neighboring notches and the center, and maps each slice linearly so its two calibrated notches land on the ideal ones.
-- `src/main.cpp` has the windows, calibration, the settings file, and the read, center, warp, snap, ESS range, dead zone, ESS, send loop.
+- `src/main.cpp` has the windows, calibration, the settings file, and the bridge loop: read the adapter, center each stick, `process_stick`, send to Dolphin.
+- `src/resource.h` has the resource ids shared by `assets/resources.rc` and the code.
 - `test/bridge_tests.cpp` has the tests.
 - `assets/icon.svg` is the app icon: a GameCube control stick in its octagonal gate. `assets/icon.ico` is made from it and committed, so building doesn't need any image tools. `assets/resources.rc` puts it in the exe. After changing the SVG, regenerate the `.ico` with ImageMagick:
 

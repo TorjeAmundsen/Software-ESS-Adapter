@@ -12,9 +12,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -25,6 +27,8 @@
 #include "ess_range.hpp"
 #include "gc_adapter.hpp"
 #include "notch.hpp"
+#include "resource.h"
+#include "stick.hpp"
 
 // Newer Windows SDK values that older mingw-w64 headers don't have.
 static constexpr DWORD DWM_USE_IMMERSIVE_DARK_MODE = 20;  // DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -67,11 +71,13 @@ enum ControlId {
     ID_ABOUT_SOURCE,
     ID_ABOUT_LICENSES,
     ID_ABOUT_CLOSE,
+    ID_RANGE_HINT,
     ID_ESS_CHECK = 200,
     ID_CALIBRATE = 300,
     ID_PORT_TEXT = 400,
     ID_NOTCH_TEXT = 500,
-    ID_MAIN_PORT = 600
+    ID_MAIN_PORT = 600,
+    ID_CLEAR_NOTCHES = 700
 };
 
 static const COLORREF COLOR_BG = RGB(32, 32, 32);
@@ -96,25 +102,26 @@ static const COLORREF COLOR_PAUSED = RGB(230, 170, 50);
 // window is open (Dolphin only gets a neutral controller), green "Active" while controller data
 // is going out to Dolphin, gray "Idle" otherwise.
 enum class LinkState { Idle, Active, Paused };
-static const RECT ACTIVE_RECT = {350, 10, 420, 28};
+static const int MAIN_RIGHT_X = 350;   // the indicator and the About button
+static const int MAIN_BOTTOM_Y = 176;  // the Edit settings / About row
+static const RECT ACTIVE_RECT = {MAIN_RIGHT_X, 10, MAIN_RIGHT_X + 70, 28};
 static LinkState g_shown_state = LinkState::Idle;
 
 // Plots in the settings window: the physical stick, and what OoT receives.
 static const RECT STICK_PLOT = {10, 252, 266, 508};
 static const RECT GAME_PLOT = {276, 252, 532, 508};
-static constexpr double STICK_PLOT_SCALE = 1.05;  // pixels per Gamecube stick unit; fits a ring at 105 + 12
-static constexpr double GAME_PLOT_SCALE = 1.5;    // pixels per in-game unit
-static constexpr int LEGEND_HEIGHT = 62;          // below each plot, so it covers nothing
+static constexpr double STICK_PLOT_SCALE = 1.05;                              // pixels per Gamecube stick unit; fits a ring at 105 + 12
+static constexpr int N64_STRAIGHT = 80, N64_DIAGONAL = 70;                    // the N64 stick range, drawn on the game plot
+static constexpr double GAME_PLOT_SCALE = 1.5;                                // pixels per in-game unit
+static constexpr int LEGEND_HEIGHT = 62;                                      // below each plot, so it covers nothing
+static const int SETTINGS_BOTTOM_Y = STICK_PLOT.bottom + LEGEND_HEIGHT + 23;  // the prompt line and Done
 static const char* const SETTINGS_CLASS = "SoftwareESSAdapterSettings";
-static constexpr int APP_ICON = 1;  // resource ids in assets/resources.rc
-static constexpr int GPL_TEXT = 2;
-static constexpr int THIRD_PARTY_TEXT = 3;
 static const char* const ABOUT_CLASS = "SoftwareESSAdapterAbout";
 static const char* const SOURCE_URL = "https://github.com/TorjeAmundsen/Software-ESS-Adapter";
 
 static DsuServer g_dsu;
 static std::atomic<bool> g_running{true};
-static std::atomic<bool> g_ess[4] = {true, true, true, true};
+static std::atomic<bool> g_ess[PORT_COUNT] = {true, true, true, true};
 static std::atomic<int> g_snap_distance{DEFAULT_SNAP_DISTANCE};
 // ESS range as the user sets it, in in-game units, and the physical stick distances that
 // gives (see ess_range.hpp). The distances are recomputed whenever the setting changes.
@@ -162,19 +169,22 @@ static AdapterFrame g_centered{};    // raw, centered on the origin
 static AdapterFrame g_calibrated{};  // after notch warp and snapping, before the ESS range and dead zone
 static AdapterFrame g_out{};
 static std::string g_adapter_status = "Starting";
-static NotchCalibration g_notches[4];
+static std::string g_notice;  // shown in the settings window's prompt line for a few seconds
+static std::chrono::steady_clock::time_point g_notice_time;
+static NotchCalibration g_notches[PORT_COUNT];
 
 static HBRUSH g_bg_brush;
 static HFONT g_font;
 static HFONT g_mono_font;   // stick readouts
 static HFONT g_title_font;  // About window heading
 
-// Settings live next to the exe: Software ESS Adapter.ini
+// Settings live next to the exe: Software ESS Adapter settings.ini. The "settings" part keeps it
+// apart from the Dolphin profile, dolphin/Software ESS Adapter.ini.
 static std::string settings_path() {
     char path[MAX_PATH];
     GetModuleFileNameA(nullptr, path, MAX_PATH);
     const std::string exe = path;
-    return exe.substr(0, exe.find_last_of('.')) + ".ini";
+    return exe.substr(0, exe.find_last_of('.')) + " settings.ini";
 }
 
 static std::string port_section(int port) {
@@ -198,27 +208,58 @@ static bool read_ints(const std::string& path, const std::string& section, const
     return true;
 }
 
+// Settings file keys, named once so loading and saving can't drift apart.
+static const char* const SETTINGS_SECTION = "Settings";
+static const char* const KEY_SNAP_DISTANCE = "SnapDistance";
+static const char* const KEY_RANGE_START = "EssStartInGame";
+static const char* const KEY_RANGE_END = "EssEndInGame";
+static const char* const KEY_DEAD_ZONE = "DeadZoneInGame";
+static const char* const KEY_ESS = "Ess";                 // per port
+static const char* const KEY_NEUTRAL = "NeutralSamples";  // per port
+static const char* const KEY_NOTCHES = "Notches";         // per port
+
+// The settings rules in one place: keeps every value in its allowed range and updates the
+// distances derived from them. Runs after loading and after every change.
+static void apply_settings() {
+    g_snap_distance = std::clamp<int>(g_snap_distance, 0, MAX_SNAP_DISTANCE);
+    g_range_end = std::clamp<int>(g_range_end, 2, max_in_game_end());
+    g_range_start = std::clamp<int>(g_range_start, 1, g_range_end - 1);
+    g_dead_zone = std::clamp<int>(g_dead_zone, 0, g_range_start - 1);
+    update_range_distances();
+    g_dead_zone_distance = physical_dead_zone(g_dead_zone);
+}
+
+static void save_settings() {
+    const std::string path = settings_path();
+    auto write = [&](const char* key, int value) {
+        WritePrivateProfileStringA(SETTINGS_SECTION, key, std::to_string(value).c_str(), path.c_str());
+    };
+    write(KEY_SNAP_DISTANCE, g_snap_distance);
+    write(KEY_RANGE_START, g_range_start);
+    write(KEY_RANGE_END, g_range_end);
+    write(KEY_DEAD_ZONE, g_dead_zone);
+}
+
 static void load_settings() {
     const std::string path = settings_path();
-    g_snap_distance =
-        std::clamp<int>(GetPrivateProfileIntA("Settings", "SnapDistance", DEFAULT_SNAP_DISTANCE, path.c_str()), 0, MAX_SNAP_DISTANCE);
+    auto read = [&](const char* key, int fallback) {
+        return static_cast<int>(GetPrivateProfileIntA(SETTINGS_SECTION, key, fallback, path.c_str()));
+    };
+    g_snap_distance = read(KEY_SNAP_DISTANCE, DEFAULT_SNAP_DISTANCE);
+    g_range_start = read(KEY_RANGE_START, ESS_IN_GAME_START);
+    g_range_end = read(KEY_RANGE_END, ESS_IN_GAME_END);
+    g_dead_zone = read(KEY_DEAD_ZONE, DEAD_ZONE_DEFAULT);
+    apply_settings();
 
-    g_range_start =
-        std::clamp<int>(GetPrivateProfileIntA("Settings", "EssStartInGame", ESS_IN_GAME_START, path.c_str()), 1, max_in_game_end() - 1);
-    g_range_end = std::clamp<int>(GetPrivateProfileIntA("Settings", "EssEndInGame", ESS_IN_GAME_END, path.c_str()), g_range_start + 1,
-                                  max_in_game_end());
-    update_range_distances();
-    g_dead_zone =
-        std::clamp<int>(GetPrivateProfileIntA("Settings", "DeadZoneInGame", DEAD_ZONE_DEFAULT, path.c_str()), 0, g_range_start - 1);
-    g_dead_zone_distance = physical_dead_zone(g_dead_zone);
+    for (int p = 0; p < PORT_COUNT; ++p) {
+        g_ess[p] = GetPrivateProfileIntA(port_section(p).c_str(), KEY_ESS, 1, path.c_str()) != 0;
 
-    for (int p = 0; p < 4; ++p) {
         // NeutralSamples = the 8 raw x,y pairs recorded at rest. Notches = x,y pairs in
         // NOTCH_NAMES order, offsets from the average neutral.
         int neutral[NOTCH_COUNT * 2], notches[NOTCH_COUNT * 2];
         NotchCalibration calibration;
-        calibration.valid = read_ints(path, port_section(p), "NeutralSamples", neutral, NOTCH_COUNT * 2, 0, 255) &&
-                            read_ints(path, port_section(p), "Notches", notches, NOTCH_COUNT * 2, -128, 127);
+        calibration.valid = read_ints(path, port_section(p), KEY_NEUTRAL, neutral, NOTCH_COUNT * 2, 0, 255) &&
+                            read_ints(path, port_section(p), KEY_NOTCHES, notches, NOTCH_COUNT * 2, -128, 127);
         if (calibration.valid) {
             uint8_t samples[NOTCH_COUNT][2];
             for (int i = 0; i < NOTCH_COUNT * 2; ++i) {
@@ -233,37 +274,79 @@ static void load_settings() {
     }
 }
 
-static void save_snap_distance() {
-    WritePrivateProfileStringA("Settings", "SnapDistance", std::to_string(g_snap_distance).c_str(), settings_path().c_str());
+static void save_ess(int port) {
+    WritePrivateProfileStringA(port_section(port).c_str(), KEY_ESS, g_ess[port] ? "1" : "0", settings_path().c_str());
 }
 
-static void save_dead_zone() {
-    WritePrivateProfileStringA("Settings", "DeadZoneInGame", std::to_string(g_dead_zone).c_str(), settings_path().c_str());
-}
-
-static void save_ess_range() {
+static void clear_notches(int port) {
     const std::string path = settings_path();
-    WritePrivateProfileStringA("Settings", "EssStartInGame", std::to_string(g_range_start).c_str(), path.c_str());
-    WritePrivateProfileStringA("Settings", "EssEndInGame", std::to_string(g_range_end).c_str(), path.c_str());
+    WritePrivateProfileStringA(port_section(port).c_str(), KEY_NEUTRAL, nullptr, path.c_str());
+    WritePrivateProfileStringA(port_section(port).c_str(), KEY_NOTCHES, nullptr, path.c_str());
+}
+
+// Why a -/+ button in the settings window can't go further, or nullptr if it can. The buttons look
+// dimmed at their limit, and clicking one shows this reason instead.
+static const char* limit_reason(int id) {
+    const int snap = g_snap_distance, start = g_range_start, end = g_range_end, dead_zone = g_dead_zone;
+    switch (id) {
+    case ID_SNAP_MINUS:
+        return snap == 0 ? "Notch snapping is already off." : nullptr;
+    case ID_SNAP_PLUS:
+        if (snap == MAX_SNAP_DISTANCE) {
+            static const std::string reason = "The notch snap distance goes up to " + std::to_string(MAX_SNAP_DISTANCE) + ".";
+            return reason.c_str();
+        }
+        return nullptr;
+    case ID_RANGE_START_MINUS:
+        if (start > dead_zone + 1) {
+            return nullptr;
+        }
+        return dead_zone > 0 ? "The ESS range start must stay above the software dead zone. Lower the dead zone first."
+                             : "The ESS range start can't go any lower.";
+    case ID_RANGE_START_PLUS:
+        return start == end - 1 ? "The ESS range start must stay below the end." : nullptr;
+    case ID_RANGE_END_MINUS:
+        return end == start + 1 ? "The ESS range end must stay above the start." : nullptr;
+    case ID_RANGE_END_PLUS:
+        return end == max_in_game_end() ? "The ESS range end can't go any higher." : nullptr;
+    case ID_DEAD_ZONE_MINUS:
+        return dead_zone == 0 ? "The software dead zone is already off." : nullptr;
+    case ID_DEAD_ZONE_PLUS:
+        return dead_zone == start - 1 ? "The software dead zone must stay below the ESS range start. Raise the start first." : nullptr;
+    }
+    return nullptr;
+}
+
+// The -/+ button pairs in the settings window and the setting each pair steps.
+struct Stepper {
+    int minus, plus;
+    std::atomic<int>* value;
+};
+static const Stepper STEPPERS[] = {{ID_SNAP_MINUS, ID_SNAP_PLUS, &g_snap_distance},
+                                   {ID_RANGE_START_MINUS, ID_RANGE_START_PLUS, &g_range_start},
+                                   {ID_RANGE_END_MINUS, ID_RANGE_END_PLUS, &g_range_end},
+                                   {ID_DEAD_ZONE_MINUS, ID_DEAD_ZONE_PLUS, &g_dead_zone}};
+
+static void set_notice(const std::string& text) {
+    std::lock_guard lock(g_mutex);
+    g_notice = text;
+    g_notice_time = std::chrono::steady_clock::now();
+}
+
+// "x,y,x,y,..." for NOTCH_COUNT pairs.
+template <typename T>
+static std::string join_pairs(const T (&pairs)[NOTCH_COUNT][2]) {
+    std::string text;
+    for (int i = 0; i < NOTCH_COUNT; ++i) {
+        text += (i > 0 ? "," : "") + std::to_string(pairs[i][0]) + "," + std::to_string(pairs[i][1]);
+    }
+    return text;
 }
 
 static void save_notches(int port, const NotchCalibration& calibration) {
-    std::string value;
-    for (int i = 0; i < NOTCH_COUNT; ++i) {
-        value += std::to_string(calibration.notch[i][0]) + "," + std::to_string(calibration.notch[i][1]);
-        if (i + 1 < NOTCH_COUNT) {
-            value += ",";
-        }
-    }
-    std::string neutral;
-    for (int i = 0; i < NOTCH_COUNT; ++i) {
-        neutral += std::to_string(calibration.neutral_samples[i][0]) + "," + std::to_string(calibration.neutral_samples[i][1]);
-        if (i + 1 < NOTCH_COUNT) {
-            neutral += ",";
-        }
-    }
-    WritePrivateProfileStringA(port_section(port).c_str(), "NeutralSamples", neutral.c_str(), settings_path().c_str());
-    WritePrivateProfileStringA(port_section(port).c_str(), "Notches", value.c_str(), settings_path().c_str());
+    const std::string path = settings_path();
+    WritePrivateProfileStringA(port_section(port).c_str(), KEY_NEUTRAL, join_pairs(calibration.neutral_samples).c_str(), path.c_str());
+    WritePrivateProfileStringA(port_section(port).c_str(), KEY_NOTCHES, join_pairs(calibration.notch).c_str(), path.c_str());
 }
 
 static void set_adapter_status(const std::string& status) {
@@ -288,8 +371,8 @@ static GCPortState center(const GCPortState& raw, const GCPortState& origin) {
 static void bridge_loop() {
     GCAdapter adapter;
     AdapterFrame raw{}, centered{}, calibrated{}, out{}, sent{}, origin{};
-    bool has_origin[4] = {};
-    bool prev_a[4] = {}, prev_b[4] = {};
+    bool has_origin[PORT_COUNT] = {};
+    bool prev_a[PORT_COUNT] = {}, prev_b[PORT_COUNT] = {};
     uint8_t samples[CALIBRATION_STEPS][2] = {};  // raw stick per calibration step
 
     auto take_calibration_request = [] {
@@ -336,20 +419,25 @@ static void bridge_loop() {
             continue;
         }
 
-        NotchCalibration notches[4];
+        NotchCalibration notches[PORT_COUNT];
         {
             std::lock_guard lock(g_mutex);
             std::copy(std::begin(g_notches), std::end(g_notches), notches);
         }
         const RangeDistances range = range_distances();
+        StickSettings stick_settings;
+        stick_settings.snap_distance = g_snap_distance;
+        stick_settings.range_start = range.start;
+        stick_settings.range_end = range.end;
+        stick_settings.dead_zone_distance = g_dead_zone_distance;
 
-        for (int p = 0; p < 4; ++p) {
+        for (int p = 0; p < PORT_COUNT; ++p) {
             // Like Dolphin and the console: the first report after plugging in is the origin.
             if (raw[p].connected && !has_origin[p]) {
                 origin[p] = raw[p];
             }
             has_origin[p] = raw[p].connected;
-            // A calibrated port centers the main stick on its saved neutral instead.
+            // With calibrated notches, the main stick is centered on the saved neutral instead.
             GCPortState port_origin = origin[p];
             if (notches[p].valid) {
                 port_origin.stick[0] = notches[p].neutral[0];
@@ -368,6 +456,7 @@ static void bridge_loop() {
                 // A records the current notch, B cancels.
                 if (b && !prev_b[p]) {
                     g_calibrating_port = -1;
+                    set_notice("Port " + std::to_string(p + 1) + " calibration cancelled.");
                 } else if (a && !prev_a[p]) {
                     const int step = g_calibration_step;
                     samples[step][0] = raw[p].stick[0];
@@ -377,28 +466,21 @@ static void bridge_loop() {
                     } else {
                         const NotchCalibration calibration = make_calibration(samples);
                         save_notches(p, calibration);
-                        std::lock_guard lock(g_mutex);
-                        g_notches[p] = calibration;
+                        {
+                            std::lock_guard lock(g_mutex);
+                            g_notches[p] = calibration;
+                        }
                         g_calibrating_port = -1;
+                        set_notice("Port " + std::to_string(p + 1) + " notches calibrated and saved.");
                     }
                 }
             }
 
             out[p] = centered[p];
-            warp_to_ideal_notches(out[p].stick, notches[p]);
-            snap_to_notch(out[p].stick, notches[p], g_snap_distance);
-            calibrated[p] = out[p];
-            if (g_ess[p]) {
-                remap_ess_range(out[p].stick, range.start, range.end);
-            }
-            // The dead zone goes after everything that moves the stick, scaled along with the ESS
-            // range, so it can never reach into ESS (see dead_zone_after_range).
-            const int dead_zone_distance = g_dead_zone_distance;
-            const double dead_zone = g_ess[p] ? dead_zone_after_range(dead_zone_distance, range.start) : dead_zone_distance;
-            apply_dead_zone(out[p].stick, dead_zone);
-            if (g_ess[p]) {
-                invert_vc_gc(out[p].stick);
-            }
+            calibrated[p] = centered[p];
+            StickSettings settings = stick_settings;
+            settings.ess = g_ess[p];
+            process_stick(out[p].stick, notches[p], settings, calibrated[p].stick);
 
             // Calibration only happens while editing, so this also covers it.
             sent[p] = out[p];
@@ -440,11 +522,9 @@ static void refresh_main(HWND hwnd) {
     }
     set_text(hwnd, ID_ADAPTER_STATUS, status);
     if (g_dsu.last_error().empty()) {
-        set_text(hwnd, ID_DSU_STATUS,
-                 "DSU server on 127.0.0.1:" + std::to_string(DsuServer::DEFAULT_PORT) +
-                     ", Dolphin clients: " + std::to_string(g_dsu.client_count()));
+        set_text(hwnd, ID_DSU_STATUS, g_dsu.client_count() > 0 ? "Dolphin connected." : "Waiting for Dolphin to connect.");
     }
-    for (int p = 0; p < 4; ++p) {
+    for (int p = 0; p < PORT_COUNT; ++p) {
         set_text(hwnd, ID_MAIN_PORT + p,
                  "Port " + std::to_string(p + 1) + ": " + (raw[p].connected ? "controller connected" : "no controller"));
     }
@@ -489,32 +569,41 @@ static void paint_active_indicator(HDC dc) {
 
 static void refresh_settings(HWND hwnd) {
     AdapterFrame raw, centered, out;
-    bool calibrated[4];
+    bool calibrated[PORT_COUNT];
+    std::string notice;
     {
         std::lock_guard lock(g_mutex);
         raw = g_raw;
         centered = g_centered;
         out = g_out;
-        for (int p = 0; p < 4; ++p) {
+        for (int p = 0; p < PORT_COUNT; ++p) {
             calibrated[p] = g_notches[p].valid;
+        }
+        if (std::chrono::steady_clock::now() - g_notice_time < std::chrono::seconds(4)) {
+            notice = g_notice;
         }
     }
 
     const int calibrating = g_calibrating_port;
-    for (int p = 0; p < 4; ++p) {
+    for (int p = 0; p < PORT_COUNT; ++p) {
         std::string text = "No controller";
         if (raw[p].connected) {
-            // Stick convention: neutral is 0, 0, right and up are positive. "game" is what OoT
+            // Stick convention: neutral is 0, 0, right and up are positive. "Game" is what OoT
             // sees after Wii VC. Fixed-width fields in a monospace font so nothing shifts.
             int in_game[2];
             vc_in_game(out[p].stick[0] - 128, out[p].stick[1] - 128, in_game);
             char buffer[64];
-            std::snprintf(buffer, sizeof(buffer), "Stick %4d,%4d  game %3d,%3d", centered[p].stick[0] - 128, centered[p].stick[1] - 128,
+            std::snprintf(buffer, sizeof(buffer), "Stick %4d,%4d  Game %3d,%3d", centered[p].stick[0] - 128, centered[p].stick[1] - 128,
                           in_game[0], in_game[1]);
             text = buffer;
         }
         set_text(hwnd, ID_PORT_TEXT + p, text);
-        set_text(hwnd, ID_NOTCH_TEXT + p, calibrated[p] ? "Notches: set" : "Notches: none");
+        set_text(hwnd, ID_NOTCH_TEXT + p, calibrated[p] ? "Calibrated" : "Not calibrated");
+        HWND clear = GetDlgItem(hwnd, ID_CLEAR_NOTCHES + p);
+        const bool show_clear = calibrated[p] && calibrating != p;
+        if ((IsWindowVisible(clear) != FALSE) != show_clear) {
+            ShowWindow(clear, show_clear ? SW_SHOW : SW_HIDE);
+        }
         set_text(hwnd, ID_CALIBRATE + p, calibrating == p ? "Cancel" : "Calibrate");
     }
 
@@ -522,8 +611,21 @@ static void refresh_settings(HWND hwnd) {
     set_text(hwnd, ID_RANGE_START_VALUE, std::to_string(g_range_start));
     set_text(hwnd, ID_RANGE_END_VALUE, std::to_string(g_range_end));
     set_text(hwnd, ID_DEAD_ZONE_VALUE, std::to_string(g_dead_zone));
+    // Repaint a -/+ button when it reaches or leaves its limit (it looks dimmed there).
+    static bool shown_at_limit[std::size(STEPPERS) * 2] = {};
+    size_t button = 0;
+    for (const Stepper& stepper : STEPPERS) {
+        for (const int id : {stepper.minus, stepper.plus}) {
+            const bool at_limit = limit_reason(id) != nullptr;
+            if (at_limit != shown_at_limit[button]) {
+                shown_at_limit[button] = at_limit;
+                InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
+            }
+            ++button;
+        }
+    }
 
-    std::string prompt = "Dolphin gets a neutral controller until you close this window.";
+    std::string prompt = notice.empty() ? "Dolphin gets a neutral controller until you close this window." : notice;
     if (calibrating >= 0) {
         const std::string port = std::to_string(calibrating + 1);
         const int step = g_calibration_step;
@@ -567,7 +669,7 @@ static void draw_item(const DRAWITEMSTRUCT& item) {
     FillRect(dc, &rect, g_bg_brush);
 
     const int id = static_cast<int>(item.CtlID);
-    if (id >= ID_ESS_CHECK && id < ID_ESS_CHECK + 4) {
+    if (id >= ID_ESS_CHECK && id < ID_ESS_CHECK + PORT_COUNT) {
         const int size = 14;
         const int top = (rect.top + rect.bottom - size) / 2;
         const RECT box = {rect.left, top, rect.left + size, top + size};
@@ -588,7 +690,14 @@ static void draw_item(const DRAWITEMSTRUCT& item) {
     } else {
         fill(dc, rect, (item.itemState & ODS_SELECTED) ? COLOR_FACE_DOWN : COLOR_FACE);
         frame(dc, rect, COLOR_BORDER);
+        if (limit_reason(id)) {
+            SetTextColor(dc, COLOR_DIM_TEXT);  // a -/+ button that can't go further
+        }
         DrawTextA(dc, text, -1, &rect, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+    }
+    // Keyboard focus (Tab), shown only once the keyboard is used, like standard Windows buttons.
+    if ((item.itemState & ODS_FOCUS) && !(item.itemState & ODS_NOFOCUSRECT)) {
+        frame(dc, rect, COLOR_ACCENT);
     }
 }
 
@@ -710,7 +819,7 @@ static void paint_plots(HDC target) {
             Rectangle(plot.dc, plot.px(-half), plot.py(half), plot.px(half) + 1, plot.py(-half) + 1);
         }
         draw_axes(plot);
-        draw_gate(plot, 105, 75, COLOR_BORDER);
+        draw_gate(plot, GATE_STRAIGHT, GATE_DIAGONAL, COLOR_BORDER);
 
         // While calibrating, a ring around where the stick should go for the current step:
         // the ideal notch, or the center for a neutral step.
@@ -727,7 +836,7 @@ static void paint_plots(HDC target) {
             DeleteObject(pen);
         }
 
-        for (int p = 0; p < 4; ++p) {
+        for (int p = 0; p < PORT_COUNT; ++p) {
             if (!raw[p].connected) {
                 continue;
             }
@@ -755,13 +864,14 @@ static void paint_plots(HDC target) {
             RoundRect(plot.dc, plot.px(-half), plot.py(half), plot.px(half) + 1, plot.py(-half) + 1, diameter, diameter);
             SelectObject(plot.dc, GetStockObject(DC_BRUSH));
         };
-        // Cell edges: dead zone covers 0 to 7, ESS reaches 26, full speed starts at 67.
-        rounded_square(26.5, 19.5, COLOR_ESS_RANGE, true);
-        rounded_square(7.5, 0, COLOR_DEAD_ZONE, true);
+        // Half a unit past the last value in each zone, so whole values fall inside.
+        const double ess_radius = OOT_WALK_MAGNITUDE - 0.5;
+        rounded_square(OOT_DEAD_ZONE + ess_radius, ess_radius, COLOR_ESS_RANGE, true);
+        rounded_square(OOT_DEAD_ZONE + 0.5, 0, COLOR_DEAD_ZONE, true);
         draw_axes(plot);
-        rounded_square(67, 60, COLOR_FULL_SPEED, false);
-        draw_gate(plot, 80, 70, COLOR_BORDER);
-        for (int p = 0; p < 4; ++p) {
+        rounded_square(OOT_DEAD_ZONE + OOT_REL_MAX, OOT_REL_MAX, COLOR_FULL_SPEED, false);
+        draw_gate(plot, N64_STRAIGHT, N64_DIAGONAL, COLOR_BORDER);
+        for (int p = 0; p < PORT_COUNT; ++p) {
             if (!raw[p].connected) {
                 continue;
             }
@@ -770,56 +880,91 @@ static void paint_plots(HDC target) {
             draw_dot(plot, p, in_game[0], in_game[1], oot_zone(in_game[0], in_game[1]) == OotZone::Ess);
         }
         draw_legend(plot, {{COLOR_ESS_RANGE, false, "ESS (turn in place)"},
-                           {COLOR_DEAD_ZONE, false, "Dead zone"},
+                           {COLOR_DEAD_ZONE, false, "Game dead zone"},
                            {COLOR_FULL_SPEED, true, "Full speed"}});
     });
 }
 
 static HWND add_control(HWND parent, const char* cls, const char* text, DWORD style, int x, int y, int w, int h, int id) {
-    HWND control = CreateWindowA(cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
+    const DWORD tab_stop = std::string(cls) == "BUTTON" ? WS_TABSTOP : 0;
+    HWND control = CreateWindowA(cls, text, WS_CHILD | WS_VISIBLE | tab_stop | style, x, y, w, h, parent,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
     SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     return control;
 }
 
+// Hint text drawn in the dim color (see handle_dark_controls).
+static std::vector<HWND> g_dim_text;
+
+static HWND add_dim_text(HWND parent, const char* text, int x, int y, int w, int h, int id) {
+    HWND control = add_control(parent, "STATIC", text, 0, x, y, w, h, id);
+    g_dim_text.push_back(control);
+    return control;
+}
+
+// Owner-drawn buttons report fast second clicks as double clicks, so both count.
+static bool is_click(WPARAM wparam) {
+    const int code = HIWORD(wparam);
+    return code == BN_CLICKED || code == BN_DOUBLECLICKED;
+}
+
+// A window that can't be resized, with an inside (client area) of width x height.
+static HWND create_fixed_window(const char* cls, const char* title, DWORD style, int width, int height, HWND owner) {
+    RECT rect = {0, 0, width, height};
+    AdjustWindowRect(&rect, style, FALSE);
+    return CreateWindowA(cls, title, style, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, owner, nullptr,
+                         GetModuleHandleA(nullptr), nullptr);
+}
+
 static void on_settings_command(HWND hwnd, int id) {
-    if (id == ID_DONE) {
+    if (id == ID_DONE || id == IDCANCEL) {  // IDCANCEL: Escape
         DestroyWindow(hwnd);
         return;
     }
-    if (id >= ID_ESS_CHECK && id < ID_ESS_CHECK + 4) {
-        g_ess[id - ID_ESS_CHECK] = !g_ess[id - ID_ESS_CHECK];
+    if (const char* reason = limit_reason(id)) {
+        set_notice(reason);
+        refresh_settings(hwnd);
+        return;
+    }
+    for (const Stepper& stepper : STEPPERS) {
+        if (id == stepper.minus || id == stepper.plus) {
+            *stepper.value += id == stepper.plus ? 1 : -1;
+            apply_settings();
+            save_settings();
+            refresh_settings(hwnd);
+            return;
+        }
+    }
+    if (id >= ID_ESS_CHECK && id < ID_ESS_CHECK + PORT_COUNT) {
+        const int port = id - ID_ESS_CHECK;
+        g_ess[port] = !g_ess[port];
+        save_ess(port);
         InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
-    } else if (id >= ID_CALIBRATE && id < ID_CALIBRATE + 4) {
+    } else if (id >= ID_CALIBRATE && id < ID_CALIBRATE + PORT_COUNT) {
         const int port = id - ID_CALIBRATE;
-        g_calibration_request = g_calibrating_port == port ? -1 : port;
-    } else if (id == ID_SNAP_MINUS || id == ID_SNAP_PLUS) {
-        const int step = id == ID_SNAP_PLUS ? 1 : -1;
-        g_snap_distance = std::clamp(g_snap_distance + step, 0, MAX_SNAP_DISTANCE);
-        save_snap_distance();
-    } else if (id == ID_RANGE_START_MINUS || id == ID_RANGE_START_PLUS) {
-        const int step = id == ID_RANGE_START_PLUS ? 1 : -1;
-        g_range_start = std::clamp(g_range_start + step, g_dead_zone + 1, g_range_end - 1);
-        update_range_distances();
-        save_ess_range();
-    } else if (id == ID_RANGE_END_MINUS || id == ID_RANGE_END_PLUS) {
-        const int step = id == ID_RANGE_END_PLUS ? 1 : -1;
-        g_range_end = std::clamp(g_range_end + step, g_range_start + 1, max_in_game_end());
-        update_range_distances();
-        save_ess_range();
-    } else if (id == ID_DEAD_ZONE_MINUS || id == ID_DEAD_ZONE_PLUS) {
-        const int step = id == ID_DEAD_ZONE_PLUS ? 1 : -1;
-        g_dead_zone = std::clamp(g_dead_zone + step, 0, g_range_start - 1);
-        g_dead_zone_distance = physical_dead_zone(g_dead_zone);
-        save_dead_zone();
+        if (g_calibrating_port == port) {
+            g_calibration_request = -1;
+            set_notice("Port " + std::to_string(port + 1) + " calibration cancelled.");
+        } else {
+            g_calibration_request = port;
+        }
+    } else if (id >= ID_CLEAR_NOTCHES && id < ID_CLEAR_NOTCHES + PORT_COUNT) {
+        const int port = id - ID_CLEAR_NOTCHES;
+        const std::string question = "Clear the notch calibration for port " + std::to_string(port + 1) + "?";
+        if (MessageBoxA(hwnd, question.c_str(), "Software ESS Adapter", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            {
+                std::lock_guard lock(g_mutex);
+                g_notches[port] = NotchCalibration{};
+            }
+            clear_notches(port);
+            set_notice("Port " + std::to_string(port + 1) + " notch calibration cleared.");
+        }
     } else if (id == ID_RANGE_DEFAULT) {
         g_range_start = ESS_IN_GAME_START;
         g_range_end = ESS_IN_GAME_END;
-        update_range_distances();
-        save_ess_range();
         g_dead_zone = DEAD_ZONE_DEFAULT;
-        g_dead_zone_distance = physical_dead_zone(g_dead_zone);
-        save_dead_zone();
+        apply_settings();
+        save_settings();
     }
     refresh_settings(hwnd);
 }
@@ -829,7 +974,7 @@ static bool handle_dark_controls(UINT msg, WPARAM wparam, LPARAM lparam, LRESULT
     if (msg == WM_CTLCOLORSTATIC) {
         HDC dc = reinterpret_cast<HDC>(wparam);
         const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lparam));
-        const bool dim = id == ID_SNAP_HINT || id == ID_DEAD_ZONE_HINT || id == ID_MAIN_HINT || id == ID_ABOUT_LEGAL;
+        const bool dim = std::find(g_dim_text.begin(), g_dim_text.end(), reinterpret_cast<HWND>(lparam)) != g_dim_text.end();
         SetTextColor(dc, dim ? COLOR_DIM_TEXT : COLOR_TEXT);
         SetBkColor(dc, COLOR_BG);
         result = reinterpret_cast<LRESULT>(g_bg_brush);
@@ -857,7 +1002,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
     switch (msg) {
     case WM_CREATE:
         use_dark_title_bar(hwnd);
-        for (int p = 0; p < 4; ++p) {
+        for (int p = 0; p < PORT_COUNT; ++p) {
             const int y = 10 + p * 30;
             const std::string label = "Port " + std::to_string(p + 1) + " ESS";
             add_control(hwnd, "BUTTON", label.c_str(), BS_OWNERDRAW, 10, y, 85, 22, ID_ESS_CHECK + p);
@@ -865,30 +1010,37 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
             HWND readout = add_control(hwnd, "STATIC", "", 0, 185, y + 3, 240, 18, ID_PORT_TEXT + p);
             SendMessageA(readout, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
             add_control(hwnd, "STATIC", "", 0, 432, y + 3, 100, 18, ID_NOTCH_TEXT + p);
+            HWND clear = add_control(hwnd, "BUTTON", "Clear", BS_OWNERDRAW, 494, y, 44, 22, ID_CLEAR_NOTCHES + p);
+            ShowWindow(clear, SW_HIDE);
         }
-        add_control(hwnd, "STATIC", "Notch snap distance", 0, 10, 137, 115, 18, ID_SNAP_LABEL);
-        add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, 130, 134, 24, 22, ID_SNAP_MINUS);
-        add_control(hwnd, "STATIC", "", SS_CENTER, 156, 137, 26, 18, ID_SNAP_VALUE);
-        add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, 184, 134, 24, 22, ID_SNAP_PLUS);
-        add_control(hwnd, "STATIC", "units (0 = off, max 10)", 0, 216, 137, 200, 18, ID_SNAP_HINT);
-        add_control(hwnd, "STATIC", "ESS range start", 0, 10, 167, 80, 18, ID_RANGE_LABEL);
-        add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, 95, 164, 24, 22, ID_RANGE_START_MINUS);
-        add_control(hwnd, "STATIC", "", SS_CENTER, 121, 167, 26, 18, ID_RANGE_START_VALUE);
-        add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, 149, 164, 24, 22, ID_RANGE_START_PLUS);
-        add_control(hwnd, "STATIC", "end", 0, 188, 167, 22, 18, ID_RANGE_END_LABEL);
-        add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, 213, 164, 24, 22, ID_RANGE_END_MINUS);
-        add_control(hwnd, "STATIC", "", SS_CENTER, 239, 167, 26, 18, ID_RANGE_END_VALUE);
-        add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, 267, 164, 24, 22, ID_RANGE_END_PLUS);
-        add_control(hwnd, "BUTTON", "Default", BS_OWNERDRAW, 306, 164, 60, 22, ID_RANGE_DEFAULT);
-        add_control(hwnd, "STATIC", "Dead zone", 0, 10, 197, 80, 18, ID_DEAD_ZONE_LABEL);
-        add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, 95, 194, 24, 22, ID_DEAD_ZONE_MINUS);
-        add_control(hwnd, "STATIC", "", SS_CENTER, 121, 197, 26, 18, ID_DEAD_ZONE_VALUE);
-        add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, 149, 194, 24, 22, ID_DEAD_ZONE_PLUS);
-        add_control(hwnd, "STATIC", "in game, rests at exactly 0, 0 (0 = off, below range start)", 0, 181, 197, 300, 18, ID_DEAD_ZONE_HINT);
+        {
+            // Settings as a table: label, -/+ controls, short hint. Every row's controls start at
+            // the same x, and every hint too.
+            const int label_x = 10, control_x = 145, hint_x = 420;
+            auto stepper = [&](int x, int y, int minus, int value, int plus) {
+                add_control(hwnd, "BUTTON", "-", BS_OWNERDRAW, x, y, 24, 22, minus);
+                add_control(hwnd, "STATIC", "", SS_CENTER, x + 26, y + 3, 30, 18, value);
+                add_control(hwnd, "BUTTON", "+", BS_OWNERDRAW, x + 58, y, 24, 22, plus);
+            };
+            add_control(hwnd, "STATIC", "Notch snapping", 0, label_x, 137, 130, 18, ID_SNAP_LABEL);
+            stepper(control_x, 134, ID_SNAP_MINUS, ID_SNAP_VALUE, ID_SNAP_PLUS);
+            add_dim_text(hwnd, "stick units, 0 = off", hint_x, 137, 115, 18, ID_SNAP_HINT);
+
+            add_control(hwnd, "STATIC", "ESS range", 0, label_x, 167, 130, 18, ID_RANGE_LABEL);
+            stepper(control_x, 164, ID_RANGE_START_MINUS, ID_RANGE_START_VALUE, ID_RANGE_START_PLUS);
+            add_control(hwnd, "STATIC", "to", SS_CENTER, control_x + 86, 167, 22, 18, ID_RANGE_END_LABEL);
+            stepper(control_x + 112, 164, ID_RANGE_END_MINUS, ID_RANGE_END_VALUE, ID_RANGE_END_PLUS);
+            add_control(hwnd, "BUTTON", "Default", BS_OWNERDRAW, control_x + 204, 164, 62, 22, ID_RANGE_DEFAULT);
+            add_dim_text(hwnd, "in game", hint_x, 167, 115, 18, ID_RANGE_HINT);
+
+            add_control(hwnd, "STATIC", "Software dead zone", 0, label_x, 197, 130, 18, ID_DEAD_ZONE_LABEL);
+            stepper(control_x, 194, ID_DEAD_ZONE_MINUS, ID_DEAD_ZONE_VALUE, ID_DEAD_ZONE_PLUS);
+            add_dim_text(hwnd, "in game, 0 = off", hint_x, 197, 115, 18, ID_DEAD_ZONE_HINT);
+        }
         add_control(hwnd, "STATIC", "Your stick", 0, STICK_PLOT.left, STICK_PLOT.top - 20, 200, 18, ID_STICK_PLOT_TITLE);
         add_control(hwnd, "STATIC", "In game (OoT on Wii VC)", 0, GAME_PLOT.left, GAME_PLOT.top - 20, 200, 18, ID_GAME_PLOT_TITLE);
-        add_control(hwnd, "STATIC", "", 0, 10, STICK_PLOT.bottom + LEGEND_HEIGHT + 27, 410, 18, ID_PROMPT);
-        add_control(hwnd, "BUTTON", "Done", BS_OWNERDRAW, 432, STICK_PLOT.bottom + LEGEND_HEIGHT + 23, 100, 24, ID_DONE);
+        add_control(hwnd, "STATIC", "", 0, 10, SETTINGS_BOTTOM_Y + 4, 410, 18, ID_PROMPT);
+        add_control(hwnd, "BUTTON", "Done", BS_OWNERDRAW, GAME_PLOT.right - 100, SETTINGS_BOTTOM_Y, 100, 24, ID_DONE);
         refresh_settings(hwnd);
         return 0;
     case WM_PAINT: {
@@ -898,14 +1050,11 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         EndPaint(hwnd, &ps);
         return 0;
     }
-    case WM_COMMAND: {
-        // Owner-drawn buttons report fast second clicks as double clicks.
-        const int code = HIWORD(wparam);
-        if (code == BN_CLICKED || code == BN_DOUBLECLICKED) {
+    case WM_COMMAND:
+        if (is_click(wparam)) {
             on_settings_command(hwnd, LOWORD(wparam));
         }
         return 0;
-    }
     case WM_DESTROY:
         // Closing the settings window ends editing: real input goes back to Dolphin.
         g_calibration_request = -1;
@@ -921,12 +1070,9 @@ static void open_settings(HWND owner) {
         SetForegroundWindow(g_settings_window);
         return;
     }
-    RECT rect = {0, 0, 542, STICK_PLOT.bottom + LEGEND_HEIGHT + 57};
-    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    AdjustWindowRect(&rect, style, FALSE);
     g_editing = true;
-    g_settings_window = CreateWindowA(SETTINGS_CLASS, "Software ESS Adapter settings", style, CW_USEDEFAULT, CW_USEDEFAULT,
-                                      rect.right - rect.left, rect.bottom - rect.top, owner, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_settings_window = create_fixed_window(SETTINGS_CLASS, "Software ESS Adapter settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                                            GAME_PLOT.right + 10, SETTINGS_BOTTOM_Y + 34, owner);
     ShowWindow(g_settings_window, SW_SHOW);
 }
 
@@ -981,15 +1127,14 @@ static LRESULT CALLBACK about_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
         SendMessageA(title, WM_SETFONT, reinterpret_cast<WPARAM>(g_title_font), TRUE);
         add_control(hwnd, "STATIC", "Created by Torje Amundsen\r\nESS map from ESS-Adapter by Skuzee", 0, 14, 44, 330, 34,
                     ID_ABOUT_CREDITS);
-        add_control(hwnd, "STATIC", "Free software under the GNU GPL v3, with no warranty.", 0, 14, 88, 330, 18, ID_ABOUT_LEGAL);
+        add_dim_text(hwnd, "Free software under the GNU GPL v3, with no warranty.", 14, 88, 330, 18, ID_ABOUT_LEGAL);
         add_control(hwnd, "BUTTON", "Source code", BS_OWNERDRAW, 14, 122, 100, 24, ID_ABOUT_SOURCE);
         add_control(hwnd, "BUTTON", "Licenses", BS_OWNERDRAW, 122, 122, 90, 24, ID_ABOUT_LICENSES);
         add_control(hwnd, "BUTTON", "Close", BS_OWNERDRAW, 254, 122, 90, 24, ID_ABOUT_CLOSE);
         return 0;
     }
     case WM_COMMAND: {
-        const int code = HIWORD(wparam);
-        if (code != BN_CLICKED && code != BN_DOUBLECLICKED) {
+        if (!is_click(wparam)) {
             return 0;
         }
         switch (LOWORD(wparam)) {
@@ -1000,6 +1145,7 @@ static LRESULT CALLBACK about_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
             open_licenses(hwnd);
             break;
         case ID_ABOUT_CLOSE:
+        case IDCANCEL:  // Escape
             DestroyWindow(hwnd);
             break;
         }
@@ -1017,11 +1163,8 @@ static void open_about(HWND owner) {
         SetForegroundWindow(g_about_window);
         return;
     }
-    RECT rect = {0, 0, 358, 160};
-    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    AdjustWindowRect(&rect, style, FALSE);
-    g_about_window = CreateWindowA(ABOUT_CLASS, "About Software ESS Adapter", style, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left,
-                                   rect.bottom - rect.top, owner, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_about_window =
+        create_fixed_window(ABOUT_CLASS, "About Software ESS Adapter", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, 358, 160, owner);
     ShowWindow(g_about_window, SW_SHOW);
 }
 
@@ -1034,14 +1177,15 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
     switch (msg) {
     case WM_CREATE:
         use_dark_title_bar(hwnd);
-        add_control(hwnd, "STATIC", "", 0, 10, 10, 340, 18, ID_ADAPTER_STATUS);
-        add_control(hwnd, "STATIC", g_dsu.last_error().c_str(), 0, 10, 30, 340, 18, ID_DSU_STATUS);
-        for (int p = 0; p < 4; ++p) {
-            add_control(hwnd, "STATIC", "", 0, 10, 60 + p * 20, 340, 18, ID_MAIN_PORT + p);
+        // The status lines wrap to two lines so error messages fit.
+        add_control(hwnd, "STATIC", "", 0, 10, 10, 335, 34, ID_ADAPTER_STATUS);
+        add_control(hwnd, "STATIC", g_dsu.last_error().c_str(), 0, 10, 46, 335, 34, ID_DSU_STATUS);
+        for (int p = 0; p < PORT_COUNT; ++p) {
+            add_control(hwnd, "STATIC", "", 0, 10, 86 + p * 20, 340, 18, ID_MAIN_PORT + p);
         }
-        add_control(hwnd, "BUTTON", "Edit settings", BS_OWNERDRAW, 10, 150, 120, 24, ID_EDIT);
-        add_control(hwnd, "STATIC", "Stick values only show while editing.", 0, 140, 154, 205, 18, ID_MAIN_HINT);
-        add_control(hwnd, "BUTTON", "About", BS_OWNERDRAW, 350, 150, 70, 24, ID_ABOUT);
+        add_control(hwnd, "BUTTON", "Edit settings", BS_OWNERDRAW, 10, MAIN_BOTTOM_Y, 120, 24, ID_EDIT);
+        add_dim_text(hwnd, "Stick values only show while editing.", 140, MAIN_BOTTOM_Y + 4, 205, 18, ID_MAIN_HINT);
+        add_control(hwnd, "BUTTON", "About", BS_OWNERDRAW, MAIN_RIGHT_X, MAIN_BOTTOM_Y, 70, 24, ID_ABOUT);
         refresh_main(hwnd);
         return 0;
     case WM_PAINT: {
@@ -1051,17 +1195,13 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
         EndPaint(hwnd, &ps);
         return 0;
     }
-    case WM_COMMAND: {
-        const int code = HIWORD(wparam);
-        if (code == BN_CLICKED || code == BN_DOUBLECLICKED) {
-            if (LOWORD(wparam) == ID_EDIT) {
-                open_settings(hwnd);
-            } else if (LOWORD(wparam) == ID_ABOUT) {
-                open_about(hwnd);
-            }
+    case WM_COMMAND:
+        if (is_click(wparam) && LOWORD(wparam) == ID_EDIT) {
+            open_settings(hwnd);
+        } else if (is_click(wparam) && LOWORD(wparam) == ID_ABOUT) {
+            open_about(hwnd);
         }
         return 0;
-    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1070,6 +1210,16 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
 }
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
+    // Only one copy can own the adapter and the DSU port, so a second start just shows the first.
+    CreateMutexA(nullptr, FALSE, "SoftwareESSAdapter.Running");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (HWND running = FindWindowA("SoftwareESSAdapter", nullptr)) {
+            ShowWindow(running, SW_RESTORE);
+            SetForegroundWindow(running);
+        }
+        return 0;
+    }
+
     load_settings();
     g_dsu.start(DsuServer::DEFAULT_PORT);
     std::thread bridge(bridge_loop);
@@ -1105,11 +1255,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     wc.lpszClassName = ABOUT_CLASS;
     RegisterClassExA(&wc);
 
-    RECT rect = {0, 0, 430, 184};
-    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    AdjustWindowRect(&rect, style, FALSE);
-    HWND hwnd = CreateWindowA("SoftwareESSAdapter", "Software ESS Adapter", style, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left,
-                              rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
+    HWND hwnd = create_fixed_window("SoftwareESSAdapter", "Software ESS Adapter", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                                    MAIN_RIGHT_X + 80, MAIN_BOTTOM_Y + 34, nullptr);
     ShowWindow(hwnd, show);
 
     // Refresh the windows at 60 Hz. SetTimer only ticks every 15.6 ms or so, which lands nowhere
@@ -1147,6 +1294,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
             if (msg.message == WM_QUIT) {
                 quit = true;
                 break;
+            }
+            // Tab moves between buttons, Space presses one, Escape closes Settings and About.
+            HWND active = GetActiveWindow();
+            if (active && IsDialogMessageA(active, &msg)) {
+                continue;
             }
             TranslateMessage(&msg);
             DispatchMessageA(&msg);

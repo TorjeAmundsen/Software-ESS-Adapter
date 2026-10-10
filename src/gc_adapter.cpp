@@ -26,7 +26,7 @@ GCAdapter::~GCAdapter() {
 
 bool GCAdapter::open() {
     if (!ctx_) {
-        error_ = "libusb failed to initialize";
+        error_ = "USB support failed to start. Restart the program.";
         return false;
     }
 
@@ -44,7 +44,7 @@ bool GCAdapter::open() {
 
     if (!device) {
         libusb_free_device_list(list, 1);
-        error_ = "Adapter not found";
+        error_ = "Adapter not found. Check that its USB cable is plugged in.";
         return false;
     }
 
@@ -73,19 +73,19 @@ bool GCAdapter::open() {
     libusb_free_device_list(list, 1);
 
     if (ret == LIBUSB_ERROR_NOT_SUPPORTED) {
-        error_ = "Adapter has no WinUSB driver (install it with Zadig, same as for Dolphin)";
+        error_ = "The adapter needs the WinUSB driver. Install it with Zadig, as in Dolphin's adapter guide.";
         handle_ = nullptr;
         return false;
     }
     if (ret != LIBUSB_SUCCESS) {
-        error_ = std::string("Cannot open adapter: ") + libusb_error_name(ret);
+        error_ = "Can't open the adapter. Unplug it, plug it back in, and wait a moment.";
         handle_ = nullptr;
         return false;
     }
 
     ret = libusb_claim_interface(handle_, 0);
     if (ret != LIBUSB_SUCCESS) {
-        error_ = std::string("Cannot claim adapter (is Dolphin using it?): ") + libusb_error_name(ret);
+        error_ = "The adapter is in use, probably by Dolphin. Set Dolphin's ports to Standard Controller.";
         libusb_close(handle_);
         handle_ = nullptr;
         return false;
@@ -117,7 +117,7 @@ GCAdapter::ReadResult GCAdapter::read(AdapterFrame& frame) {
         return ReadResult::Timeout;
     }
     if (ret != LIBUSB_SUCCESS) {
-        error_ = std::string("Adapter read failed: ") + libusb_error_name(ret);
+        error_ = "Lost the adapter. Reconnecting.";
         return ReadResult::Error;
     }
     // Short or non-HID reports happen for a few frames after init. Skip them.
@@ -125,7 +125,7 @@ GCAdapter::ReadResult GCAdapter::read(AdapterFrame& frame) {
         return ReadResult::Timeout;
     }
 
-    for (int port = 0; port < 4; ++port) {
+    for (int port = 0; port < PORT_COUNT; ++port) {
         const uint8_t* d = &payload[1 + 9 * port];
         GCPortState& s = frame[port];
         // Bit 4 = wired controller, bit 5 = wavebird.

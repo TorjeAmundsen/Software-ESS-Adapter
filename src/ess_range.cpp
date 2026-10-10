@@ -9,8 +9,9 @@
 #include <cstdlib>
 
 #include "ess.hpp"
+#include "notch.hpp"
 
-static constexpr double FULL_TILT = 105;  // Gamecube straight range assumed by gc_to_n64
+static constexpr double FULL_TILT = GATE_STRAIGHT;  // the Gamecube straight range gc_to_n64 assumes
 
 void vc_in_game(int gc_x, int gc_y, int in_game[2]) {
     // VC dead zone on each axis, then it scales the vector down to length 56, then a curve per
@@ -33,13 +34,14 @@ void vc_in_game(int gc_x, int gc_y, int in_game[2]) {
 
 OotZone oot_zone(int x, int y) {
     auto rel = [](int c) {
-        return c > 7 ? std::min(c, 67) - 7 : c < -7 ? std::max(c, -67) + 7 : 0;
+        const int dz = OOT_DEAD_ZONE, top = OOT_DEAD_ZONE + OOT_REL_MAX;
+        return c > dz ? std::min(c, top) - dz : c < -dz ? std::max(c, -top) + dz : 0;
     };
     const int rx = rel(x), ry = rel(y);
     if (rx == 0 && ry == 0) {
         return OotZone::DeadZone;
     }
-    return std::sqrt(static_cast<double>(rx * rx + ry * ry)) < 20 ? OotZone::Ess : OotZone::Walk;
+    return std::sqrt(static_cast<double>(rx * rx + ry * ry)) < OOT_WALK_MAGNITUDE ? OotZone::Ess : OotZone::Walk;
 }
 
 int vc_in_game(int gc_offset) {
