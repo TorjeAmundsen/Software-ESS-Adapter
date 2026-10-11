@@ -92,28 +92,40 @@ std::vector<int> table_key(const NotchCalibration& notches, const StickSettings&
     return key;
 }
 
-// The in-game values a position may take, per axis: lo[axis] to hi[axis].
+// The in-game values a position may take, per axis: lo[axis] to hi[axis], and the lowest zone
+// it may be in (see zone_rank).
 struct Box {
     int lo[2] = {-127, -127};
     int hi[2] = {127, 127};
+    int min_zone = 0;
 };
+
+// The rule is there to keep dead zone, ESS, walking and running in that order, so a pair's place
+// in that order: 0 to 3, with full speed counted as running.
+int zone_rank(int x, int y) {
+    return std::min(static_cast<int>(oot_zone(x, y)), static_cast<int>(OotZone::Run));
+}
 
 // How far a value is outside [lo, hi].
 int outside(int value, int lo, int hi) {
     return std::max({0, lo - value, value - hi});
 }
 
-// The in-game pair closest to `wanted` inside the box. If the game can't produce any such pair,
-// the one that is least far outside.
+// The in-game pair closest to `wanted` inside the box and in its zone or a later one. If the game
+// can't produce any such pair, the one that is least far outside, keeping the axes in the box
+// first: that is the rule as written.
 std::array<int, 2> closest_allowed(const Reachable& r, const std::array<int, 2>& wanted, const Box& box) {
     auto short_by = [&](int x, int y) {
         return outside(x, box.lo[0], box.hi[0]) + outside(y, box.lo[1], box.hi[1]);
     };
+    auto zones_short = [&](int x, int y) {
+        return box.min_zone > 0 ? std::max(0, box.min_zone - zone_rank(x, y)) : 0;
+    };
     std::array<int, 2> best = wanted;
-    long best_score = std::numeric_limits<long>::max();
+    long long best_score = std::numeric_limits<long long>::max();
     auto consider = [&](int x, int y) {
-        const long dx = x - wanted[0], dy = y - wanted[1];
-        const long score = short_by(x, y) * 1000000L + dx * dx + dy * dy;
+        const long long dx = x - wanted[0], dy = y - wanted[1];
+        const long long score = short_by(x, y) * 1000000000LL + zones_short(x, y) * 1000000LL + dx * dx + dy * dy;
         if (score < best_score) {
             best_score = score;
             best = {x, y};
@@ -128,7 +140,7 @@ std::array<int, 2> closest_allowed(const Reachable& r, const std::array<int, 2>&
             }
         }
     }
-    if (short_by(best[0], best[1]) > 0) {
+    if (short_by(best[0], best[1]) > 0 || zones_short(best[0], best[1]) > 0) {
         for (const auto& pair : r.pairs) {
             consider(pair[0], pair[1]);
         }
@@ -192,7 +204,7 @@ Table build_table(const NotchCalibration& notches, const StickSettings& settings
 
     // Each quadrant from center outward, row by row, so the position one step closer to center on
     // each axis is always done first. Moving outward, an axis's in-game value may not move back the
-    // other way. Positions on the axes belong to two quadrants and come out the same in both, since
+    // other way, and the pair may not fall back to an earlier zone (dead zone, ESS, walk, run). Positions on the axes belong to two quadrants and come out the same in both, since
     // they only depend on positions further in on the same axis and on their own bounds. Together
     // the quadrants make each axis's in-game value follow its input in the same direction across
     // the whole stick.
@@ -216,7 +228,9 @@ Table build_table(const NotchCalibration& notches, const StickSettings& settings
                         Box box = bounds[index];
                         for (int axis = 0; axis < 2; ++axis) {
                             if (inner[axis] > 0) {
-                                const int limit = game[index - step[axis]][axis];
+                                const std::array<int, 2>& further_in = game[index - step[axis]];
+                                box.min_zone = std::max(box.min_zone, zone_rank(further_in[0], further_in[1]));
+                                const int limit = further_in[axis];
                                 if (outward[axis] > 0) {
                                     box.lo[axis] = std::max(box.lo[axis], limit);
                                 } else {
@@ -225,7 +239,8 @@ Table build_table(const NotchCalibration& notches, const StickSettings& settings
                             }
                         }
                         const std::array<int, 2>& normal = baseline[index];
-                        if (outside(normal[0], box.lo[0], box.hi[0]) == 0 && outside(normal[1], box.lo[1], box.hi[1]) == 0) {
+                        if (outside(normal[0], box.lo[0], box.hi[0]) == 0 && outside(normal[1], box.lo[1], box.hi[1]) == 0 &&
+                            zone_rank(normal[0], normal[1]) >= box.min_zone) {
                             // Nothing moves back: send the normal result unchanged.
                             game[index] = normal;
                             table.sent[2 * index] = steps[index][0];

@@ -26,9 +26,12 @@ struct StickSettings {
 //   3. the software dead zone, scaled along with the ESS range so it never reaches into ESS,
 //   4. the ESS map (only with ESS on): on Wii VC the whole map, on Ship of Harkinian its N64
 //      values, sent as bytes SoH turns into them,
-//   5. a pass that keeps each axis's in-game value moving the same way as its input.
+//   5. a pass that keeps each axis's in-game value moving the same way as its input, and the zones
+//      in order: moving outward never goes from walking back to ESS, for example.
 // OoT speedrun rules say that with one input axis held, moving the other axis's input one way must
-// never move that axis's output the other way. In game, after Wii VC, the ESS map can, by a unit
+// never move that axis's output the other way, so that dead zone, ESS, walking and running stay in
+// that order. Even with each axis in order, a held axis can drop a little, enough to dip from walking
+// back into ESS for a unit, so step 5 keeps the zones in order too. In game, after Wii VC, the ESS map can, by a unit
 // or two near the diagonals and more with a wider ESS range. On SoH, its octagon can. So can notch snapping and notch
 // offsets, ESS on or off: they move both axes, and VC's length limit then pulls one back. Step 5
 // works from center outward: each stick position gets the in-game pair closest to its normal

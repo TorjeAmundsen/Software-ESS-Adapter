@@ -278,6 +278,7 @@ static void test_vc_and_conversion() {
     CHECK(physical_start(VC, default_ess_start(VC)) == ESS_DEFAULT_START);
     CHECK(physical_end(VC, ESS_IN_GAME_END) == ESS_DEFAULT_END);
     CHECK(physical_start(VC, 9) == physical_start(VC, 8));  // 8 is unreachable, so 8 and 9 start together
+    CHECK(max_in_game_end(VC) == 45 && max_in_game_end(SOH) == 45);  // as on ElectroModder's adapter
 
     // Software dead zone: nothing that would read 2 or less gets through, 3 and up is untouched.
     const int dead_zone = physical_dead_zone(VC, 2);
@@ -522,6 +523,36 @@ static void test_ess_range(Game game) {
         }
         CHECK(ok);
     }
+    // A custom range keeps the stock map's ESS shape: how far ESS reaches on a diagonal compared to
+    // a cardinal stays the same as with the stock range, even for extreme ranges, to within two
+    // diagonal steps (narrow ranges are only a few stick units wide, and VC skips some values) and
+    // 5% (far out, VC's length limit bends the values away from the map's formula). A plain radial
+    // remap is much further off: with range 3 to 7, ESS reached 15.6 on the diagonal where the stock
+    // shape says 10.
+    auto ess_reach = [&](int start, int end, bool diagonal) {
+        double last = 0;
+        for (int d = 1; d <= 100; ++d) {
+            int game_pair[2];
+            pipeline(d, diagonal ? d : 0, start, end, 0, game_pair);
+            if (oot_zone(game_pair[0], game_pair[1]) == OotZone::Ess) {
+                last = diagonal ? d * std::sqrt(2.0) : d;
+            }
+        }
+        return last;
+    };
+    const double stock_ratio = ess_reach(stock_ess_start(game), stock_ess_end(game), true) /
+                               ess_reach(stock_ess_start(game), stock_ess_end(game), false);
+    for (const auto& range : {std::make_pair(3, 7), std::make_pair(5, 15), std::make_pair(9, 40), std::make_pair(15, 50)}) {
+        const int start = physical_start(game, range.first), end = std::max(physical_end(game, range.second), start + 1);
+        const double diagonal = ess_reach(start, end, true), expected = stock_ratio * ess_reach(start, end, false);
+        const bool same_shape = std::fabs(diagonal - expected) <= 2 * std::sqrt(2.0) + 0.05 * expected;
+        if (!same_shape) {
+            std::printf("%s: ESS range %d-%d reaches %.1f on a diagonal, the stock shape says %.1f\n", game_name, range.first,
+                        range.second, diagonal, expected);
+        }
+        CHECK(same_shape);
+    }
+
     bool resting_ok = true;
     for (int x = -60; x <= 60; ++x) {
         for (int y = -60; y <= 60; ++y) {
@@ -646,7 +677,9 @@ static void test_dsu_server() {
 }
 
 // Speedrun rule: with one input axis held, moving the other axis's input one way must never move
-// that axis's in-game value the other way. Sweeps every raw stick position (0 to 255 on both
+// that axis's in-game value the other way, so that dead zone, ESS, walking and running stay in that
+// order. Checks both: each axis, and the zones outward from the middle of every line (full speed
+// counts as running). Sweeps every raw stick position (0 to 255 on both
 // axes, past the gate too) and returns how many steps break that, printing the first. The center
 // has to read 0, 0, and without calibration no axis may point the other way from the stick.
 static int monotonic_breaks(const char* name, const NotchCalibration& cal, const StickSettings& settings) {
@@ -670,6 +703,7 @@ static int monotonic_breaks(const char* name, const NotchCalibration& cal, const
     for (int axis = 0; axis < 2; ++axis) {
         for (int held = 0; held < 256; ++held) {
             int previous = -128;
+            int zone[256];
             for (int moved = 0; moved < 256; ++moved) {
                 int game[2];
                 game_at(axis == 0 ? moved : held, axis == 0 ? held : moved, game);
@@ -680,6 +714,17 @@ static int monotonic_breaks(const char* name, const NotchCalibration& cal, const
                     report("points the other way:", axis, moved, held, game[axis], previous);
                 }
                 previous = game[axis];
+                zone[moved] = std::min(static_cast<int>(oot_zone(game[0], game[1])), static_cast<int>(OotZone::Run));
+            }
+            for (int moved = 129; moved < 256; ++moved) {
+                if (zone[moved] < zone[moved - 1]) {
+                    report("fell back to zone", axis, moved, held, zone[moved], zone[moved - 1]);
+                }
+            }
+            for (int moved = 127; moved >= 0; --moved) {
+                if (zone[moved] < zone[moved + 1]) {
+                    report("fell back to zone", axis, moved, held, zone[moved], zone[moved + 1]);
+                }
             }
         }
     }
@@ -709,6 +754,10 @@ static void test_axes_monotonic(Game game) {
     wide.range_end = physical_end(game, 40);
     StickSettings low_start = defaults;
     low_start.range_start = physical_start(game, 3);
+    // A narrow range: past its end the held axis shrinks enough to dip from walking back into ESS.
+    StickSettings narrow = defaults;
+    narrow.range_start = physical_start(game, 5);
+    narrow.range_end = physical_end(game, 13);
     // Targets turned 20 degrees, alternately toward each other, at 60% to 115% of the ideal
     // distance: neighbors end up 5 degrees apart.
     NotchCalibration offsets = turned;
@@ -744,6 +793,7 @@ static void test_axes_monotonic(Game game) {
     } cases[] = {{"defaults", NotchCalibration{}, defaults},
                  {"ESS range 9 to 40", NotchCalibration{}, wide},
                  {"ESS range 3 to 26", NotchCalibration{}, low_start},
+                 {"ESS range 5 to 13", NotchCalibration{}, narrow},
                  {"turned notches", turned, defaults},
                  {"turned notches, ESS off, snap 5", turned, ess_off},
                  {"big offsets, snap 5", offsets, snapping},

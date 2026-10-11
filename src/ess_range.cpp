@@ -130,7 +130,7 @@ int stock_ess_end(Game game) {
 }
 
 int max_in_game_end(Game game) {
-    return stock_in_game(game, ESS_MAX_END);
+    return std::min(stock_in_game(game, ESS_MAX_END), ESS_IN_GAME_MAX_END);
 }
 
 int physical_dead_zone(Game game, int in_game) {
@@ -149,28 +149,95 @@ void apply_dead_zone(uint8_t stick[2], double distance) {
     }
 }
 
+// The ESS map's N64 stage as the formula gc_to_n64 implements, before rounding, for
+// 0 <= y <= x: the in-game values the stock map aims for, on a continuous stick.
+static void n64_exact(double x, double y, double out[2]) {
+    const double s = 5 * x + 2 * y;
+    const double distance = std::min(s / 525, 1.0);
+    const double closeness = s > 0 ? 7 * y / s : 0;
+    const double scale = distance * distance * distance * closeness * (70.0 / 75 - 80.0 / 105) + 80.0 / 105;
+    out[0] = x * scale;
+    out[1] = y * scale;
+}
+
+// How far out the stock map's ESS starts and ends in a direction (a unit vector), in stick
+// units: where the in-game stick leaves OoT's square dead zone (7.5, halfway between 7 and 8),
+// and where its magnitude past that reaches 19.5 (halfway between 19 and 20, so 26.5 on a
+// cardinal). Smooth in the direction, unlike the rounded values.
+struct EssEdges {
+    double start, end;
+};
+static EssEdges stock_ess_edges(double dx, double dy) {
+    double a = std::fabs(dx), b = std::fabs(dy);
+    if (b > a) {
+        std::swap(a, b);
+    }
+    auto at = [&](double distance, double game[2]) {
+        n64_exact(a * distance, b * distance, game);
+    };
+    // Both grow with distance, so halve the interval until it's tiny.
+    auto solve = [&](auto past_edge) {
+        double low = 0, high = FULL_TILT;
+        for (int i = 0; i < 50; ++i) {
+            const double mid = (low + high) / 2;
+            double game[2];
+            at(mid, game);
+            (past_edge(game) ? high : low) = mid;
+        }
+        return (low + high) / 2;
+    };
+    EssEdges edges;
+    edges.start = solve([](const double game[2]) {
+        return game[0] >= OOT_DEAD_ZONE + 0.5;  // x is the larger axis
+    });
+    edges.end = solve([](const double game[2]) {
+        const double rx = std::max(game[0] - OOT_DEAD_ZONE, 0.0), ry = std::max(game[1] - OOT_DEAD_ZONE, 0.0);
+        return std::sqrt(rx * rx + ry * ry) >= OOT_WALK_MAGNITUDE - 0.5;
+    });
+    return edges;
+}
+
 void remap_ess_range(Game game, uint8_t stick[2], int start, int end) {
     const double x = stick[0] - 128;
     const double y = stick[1] - 128;
     const double r = std::sqrt(x * x + y * y);
-    if (r == 0 || r >= FULL_TILT) {
+    if (r == 0 || r >= FULL_TILT || (start == stock_ess_start(game) && end == stock_ess_end(game))) {
         return;
     }
 
-    // Piecewise linear: [0, start] -> [0, S], [start, end] -> [S, E], [end, 105] -> [E, 105].
-    const double S = stock_ess_start(game), E = stock_ess_end(game);
-    double mapped;
-    if (r < start) {
-        // Stay just under the value that rounds up to S, so nothing below start enters the range.
-        mapped = std::min(r * S / start, S - 0.501);
-    } else if (r <= end) {
-        mapped = S + (r - start) * (E - S) / (end - start);
-    } else {
-        // Stay at or over the value that rounds up past E, so nothing above end enters the range.
-        mapped = std::max(E + (r - end) * (FULL_TILT - E) / (FULL_TILT - end), E + 0.5);
-    }
+    // Start, end and the stock anchors are cardinal distances. OoT's ESS edge isn't round (the
+    // game's dead zone is square), so in other directions the stock map's ESS starts and ends
+    // further out. Each of them scales with the stock map's edge in this direction, so the custom
+    // range has the stock map's ESS shape everywhere, not only on the cardinals.
+    static const EssEdges cardinal = stock_ess_edges(1, 0);
+    const EssEdges here = stock_ess_edges(x / r, y / r);
+    const double start_scale = here.start / cardinal.start, end_scale = here.end / cardinal.end;
+    const double S = stock_ess_start(game) * start_scale, E = stock_ess_end(game) * end_scale;
+    const double range_start = start * start_scale;
+    const double range_end = std::min(end * end_scale, FULL_TILT - 1);
 
-    const double scale = mapped / r;
-    stick[0] = static_cast<uint8_t>(std::clamp<long>(std::lround(x * scale), -128, 127) + 128);
-    stick[1] = static_cast<uint8_t>(std::clamp<long>(std::lround(y * scale), -128, 127) + 128);
+    // Piecewise linear: [0, start] -> [0, S], [start, end] -> [S, E], [end, 105] -> [E, 105].
+    double out[2];
+    if (r < range_start) {
+        // The same scale in every direction, so the software dead zone (a square) keeps its shape.
+        // Each axis stays just under the cardinal anchor, the edge of the game's dead zone (also a
+        // square), so nothing below start rounds up into the range.
+        const double edge = stock_ess_start(game) - 0.501;
+        for (int i = 0; i < 2; ++i) {
+            const double value = (i == 0 ? x : y) * S / range_start;
+            out[i] = std::clamp(value, -edge, edge);
+        }
+    } else {
+        double mapped;
+        if (r <= range_end) {
+            mapped = S + (r - range_start) * (E - S) / (range_end - range_start);
+        } else {
+            // Stay at or over the value that rounds up past E, so nothing above end enters the range.
+            mapped = std::max(E + (r - range_end) * (FULL_TILT - E) / (FULL_TILT - range_end), E + 0.5);
+        }
+        out[0] = x * mapped / r;
+        out[1] = y * mapped / r;
+    }
+    stick[0] = static_cast<uint8_t>(std::clamp<long>(std::lround(out[0]), -128, 127) + 128);
+    stick[1] = static_cast<uint8_t>(std::clamp<long>(std::lround(out[1]), -128, 127) + 128);
 }

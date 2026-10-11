@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -108,12 +109,11 @@ static const COLORREF COLOR_BORDER = RGB(95, 95, 95);
 static const COLORREF COLOR_ACCENT = RGB(0, 120, 215);
 static const COLORREF COLOR_PLOT_AXIS = RGB(138, 138, 138);
 static const COLORREF COLOR_DOT_IN_RANGE = RGB(80, 200, 255);
-static const COLORREF COLOR_CALIBRATION_TARGET = RGB(90, 210, 120);
-// The plots color everything by what OoT does with it, in OotZone order (pyESS's palette: warm
-// against cool rather than red against green, the movement zones getting darker as they speed up,
-// and ESS set apart in amber).
-static const COLORREF ZONE_COLORS[] = {RGB(0x1B, 0x1F, 0x27), RGB(0xF0, 0xA9, 0x2E), RGB(0xA8, 0xE6, 0xD4), RGB(0x4A, 0x9F, 0xC4),
-                                       RGB(0x15, 0x45, 0x6B)};
+static const COLORREF COLOR_CALIBRATION_TARGET = RGB(255, 80, 200);  // pink, apart from the zone colors
+// The plots color everything by what OoT does with it, in OotZone order: only ESS in color, the
+// movement zones in grays that get darker as Link speeds up.
+static const COLORREF ZONE_COLORS[] = {RGB(0x1A, 0x1A, 0x1A), RGB(0x3F, 0xBF, 0x6F), RGB(0x5C, 0x5C, 0x5C), RGB(0x46, 0x46, 0x46),
+                                       RGB(0x32, 0x32, 0x32)};
 static const char* const ZONE_NAMES[] = {"Dead zone", "ESS (turn in place)", "Walk", "Run", "Full speed"};
 static const COLORREF COLOR_ACTIVE = RGB(60, 200, 90);
 static const COLORREF COLOR_PAUSED = RGB(230, 170, 50);
@@ -128,16 +128,17 @@ static const RECT ACTIVE_RECT = {MAIN_RIGHT_X, 10, MAIN_RIGHT_X + 70, 28};
 static LinkState g_shown_state = LinkState::Idle;
 
 // Plots in the settings window: the physical stick, and what OoT receives, both at the same
-// scale. The game plot is smaller, so the zone legend goes under it.
-static constexpr int PLOT_SCALE = 2;                         // pixels per unit, stick or in-game
+// scale, and the zone legend beside the game plot.
+static constexpr int PLOT_SCALE = 1;                         // pixels per unit, stick or in-game
 static constexpr int STICK_PLOT_RANGE = 118;                 // stick units from center to edge; fits a ring at 105 + 12
 static constexpr int GAME_PLOT_RANGE = 90;                   // in-game units from center to edge; fits SoH's 85
 static constexpr int N64_STRAIGHT = 80, N64_DIAGONAL = 70;   // the N64 stick range, drawn on the game plot
-static constexpr int LEGEND_HEIGHT = 10 + 20 * 5;            // under the game plot: a row per zone
+static constexpr int LEGEND_WIDTH = 150;                     // beside the game plot: a row per zone
 static constexpr int STICK_PLOT_SIZE = 2 * PLOT_SCALE * STICK_PLOT_RANGE, GAME_PLOT_SIZE = 2 * PLOT_SCALE * GAME_PLOT_RANGE;
 static const RECT STICK_PLOT = {10, 312, 10 + STICK_PLOT_SIZE, 312 + STICK_PLOT_SIZE};
 static const RECT GAME_PLOT = {STICK_PLOT.right + 10, 312, STICK_PLOT.right + 10 + GAME_PLOT_SIZE, 312 + GAME_PLOT_SIZE};
 static const int SETTINGS_BOTTOM_Y = STICK_PLOT.bottom + 12;  // the prompt line and Done
+static const int SETTINGS_WIDTH = std::max<int>(548, GAME_PLOT.right + LEGEND_WIDTH + 10);  // fits the settings rows too
 static const char* const SETTINGS_CLASS = "SoftwareESSAdapterSettings";
 static const char* const ABOUT_CLASS = "SoftwareESSAdapterAbout";
 static const char* const OFFSETS_CLASS = "SoftwareESSAdapterOffsets";
@@ -195,11 +196,17 @@ static int g_offsets_port = 0;
 static int g_held_notch = -1;  // the notch the stick is on, highlighted in that window, or -1
 static std::atomic<int> g_calibration_step{0};  // 0 to CALIBRATION_STEPS - 1, see notch.hpp
 
-static std::mutex g_mutex;  // guards the six below
+static std::mutex g_mutex;  // guards the seven below
 static AdapterFrame g_raw{};
 static AdapterFrame g_centered{};    // raw, centered on the origin
 static AdapterFrame g_calibrated{};  // after notch warp and snapping, before the ESS range and dead zone
 static AdapterFrame g_out{};
+// Recent g_out frames with when they were made, so the "In game" plot can lag like the game does.
+struct TimedFrame {
+    std::chrono::steady_clock::time_point at;
+    AdapterFrame frame;
+};
+static std::deque<TimedFrame> g_out_history;
 static std::string g_adapter_status = "Starting";
 static std::string g_notice;  // shown in the settings window's prompt line for a few seconds
 static std::chrono::steady_clock::time_point g_notice_time;
@@ -402,7 +409,12 @@ static const char* limit_reason(int id) {
     case ID_RANGE_END_MINUS:
         return end == start + 1 ? "The ESS range end must stay above the start." : nullptr;
     case ID_RANGE_END_PLUS:
-        return end == max_in_game_end(g_game) ? "The ESS range end can't go any higher." : nullptr;
+        if (end == max_in_game_end(g_game)) {
+            static const std::string reason =
+                "The ESS range end goes up to " + std::to_string(ESS_IN_GAME_MAX_END) + ", as on ElectroModder's adapter.";
+            return reason.c_str();
+        }
+        return nullptr;
     case ID_DEAD_ZONE_MINUS:
         return dead_zone == 0 ? "The software dead zone is already off." : nullptr;
     case ID_DEAD_ZONE_PLUS:
@@ -475,6 +487,22 @@ static std::chrono::microseconds input_lag() {
     return std::chrono::milliseconds(g_game == Game::SoH ? g_input_lag.load() : 0);
 }
 
+// What the game has right now: g_out from the input lag ago, or the oldest kept if the lag is
+// longer than the history so far. Call with g_mutex held.
+static AdapterFrame game_has_now() {
+    const auto lag = input_lag();
+    if (lag.count() == 0 || g_out_history.empty()) {
+        return g_out;
+    }
+    const auto due = std::chrono::steady_clock::now() - lag;
+    for (auto it = g_out_history.rbegin(); it != g_out_history.rend(); ++it) {
+        if (it->at <= due) {
+            return it->frame;
+        }
+    }
+    return g_out_history.front().frame;
+}
+
 // The stick settings for a port, as they are right now.
 static StickSettings stick_settings(int port) {
     const RangeDistances range = range_distances();
@@ -526,6 +554,7 @@ static void bridge_loop() {
         sender.push(AdapterFrame{}, g_game, input_lag());  // reports every port as disconnected
         std::lock_guard lock(g_mutex);
         g_raw = g_centered = g_calibrated = g_out = AdapterFrame{};
+        g_out_history.clear();
     };
     auto wait = [&](int ms) {
         for (int waited = 0; waited < ms && g_running; waited += 100) {
@@ -643,6 +672,11 @@ static void bridge_loop() {
         g_centered = centered;
         g_calibrated = calibrated;
         g_out = out;
+        const auto now = std::chrono::steady_clock::now();
+        g_out_history.push_back({now, out});
+        while (g_out_history.front().at < now - std::chrono::milliseconds(MAX_INPUT_LAG_MS + 50)) {
+            g_out_history.pop_front();
+        }
         g_adapter_status = "Adapter connected";
     }
 }
@@ -735,7 +769,7 @@ static void refresh_settings(HWND hwnd) {
         std::lock_guard lock(g_mutex);
         raw = g_raw;
         centered = g_centered;
-        out = g_out;
+        out = game_has_now();  // the Game readout lags like the game
         for (int p = 0; p < PORT_COUNT; ++p) {
             calibrated[p] = g_notches[p].valid;
         }
@@ -808,7 +842,7 @@ static void refresh_settings(HWND hwnd) {
     }
     set_text(hwnd, ID_PROMPT, prompt);
     InvalidateRect(hwnd, &STICK_PLOT, FALSE);
-    const RECT game_with_legend = {GAME_PLOT.left, GAME_PLOT.top, GAME_PLOT.right, GAME_PLOT.bottom + LEGEND_HEIGHT};
+    const RECT game_with_legend = {GAME_PLOT.left, GAME_PLOT.top, GAME_PLOT.right + LEGEND_WIDTH, GAME_PLOT.bottom};
     InvalidateRect(hwnd, &game_with_legend, FALSE);
 }
 
@@ -874,8 +908,8 @@ static void draw_item(const DRAWITEMSTRUCT& item) {
     }
 }
 
-// Off-screen canvas for one plot (and the legend under the game plot), so the 60 Hz redraw doesn't
-// flicker. w and h are the plot square; `below` more rows follow under it.
+// Off-screen canvas for one plot (and the legend beside the game plot), so the 60 Hz redraw doesn't
+// flicker. w and h are the plot square; `beside` more columns follow to its right.
 struct Plot {
     HDC dc;
     int w, h;
@@ -888,20 +922,20 @@ struct Plot {
 };
 
 template <typename Draw>
-static void draw_plot(HDC target, const RECT& rect, int below, Draw draw) {
+static void draw_plot(HDC target, const RECT& rect, int beside, Draw draw) {
     Plot plot{CreateCompatibleDC(target), rect.right - rect.left, rect.bottom - rect.top};
-    HBITMAP bitmap = CreateCompatibleBitmap(target, plot.w, plot.h + below);
+    HBITMAP bitmap = CreateCompatibleBitmap(target, plot.w + beside, plot.h);
     HGDIOBJ old_bitmap = SelectObject(plot.dc, bitmap);
     HGDIOBJ old_pen = SelectObject(plot.dc, GetStockObject(DC_PEN));
     HGDIOBJ old_brush = SelectObject(plot.dc, GetStockObject(DC_BRUSH));
     HGDIOBJ old_font = SelectObject(plot.dc, g_font);
     SetBkMode(plot.dc, TRANSPARENT);
-    fill(plot.dc, {0, plot.h, plot.w, plot.h + below}, COLOR_BG);
+    fill(plot.dc, {plot.w, 0, plot.w + beside, plot.h}, COLOR_BG);
 
     draw(plot);
 
     frame(plot.dc, {0, 0, plot.w, plot.h}, COLOR_BORDER);
-    BitBlt(target, rect.left, rect.top, plot.w, plot.h + below, plot.dc, 0, 0, SRCCOPY);
+    BitBlt(target, rect.left, rect.top, plot.w + beside, plot.h, plot.dc, 0, 0, SRCCOPY);
     SelectObject(plot.dc, old_font);
     SelectObject(plot.dc, old_brush);
     SelectObject(plot.dc, old_pen);
@@ -931,10 +965,10 @@ static void make_zone_image(ZoneImage& image, int w, int h, int range, ZoneAt zo
             units[(x + range) * span + (y + range)] = colors[static_cast<int>(zone_at(x, y))];
         }
     }
-    // Pixel column c shows unit floor((c - w/2 + 1) / 2), so unit x covers w/2 + 2x - 1 and w/2 + 2x
-    // (likewise for rows, upward), the pixels Plot::px and py put it at.
+    // Pixel column c shows the unit whose center Plot::px puts nearest to it, counting from w/2
+    // (likewise for rows, upward from h/2).
     auto unit = [range](int offset) {
-        const int u = static_cast<int>(std::floor((offset + 1) / static_cast<double>(PLOT_SCALE)));
+        const int u = static_cast<int>(std::floor((offset + PLOT_SCALE / 2.0) / PLOT_SCALE));
         return std::clamp(u, -range, range) + range;
     };
     image.w = w;
@@ -967,22 +1001,16 @@ static void draw_axes(const Plot& plot) {
     LineTo(plot.dc, plot.w / 2, plot.h);
 }
 
-// A closed outline through the 8 points, in NOTCH_NAMES order.
-template <typename T>
-static void draw_outline(const Plot& plot, const T (&points)[NOTCH_COUNT][2], COLORREF color) {
-    POINT outline[NOTCH_COUNT + 1];
-    for (int i = 0; i <= NOTCH_COUNT; ++i) {
-        outline[i] = {plot.px(points[i % NOTCH_COUNT][0]), plot.py(points[i % NOTCH_COUNT][1])};
-    }
-    SetDCPenColor(plot.dc, color);
-    Polyline(plot.dc, outline, NOTCH_COUNT + 1);
-}
-
 // Octagon through (0, straight) and (corner, corner) in each direction.
 static void draw_gate(const Plot& plot, double straight, double corner, COLORREF color) {
     const double points[NOTCH_COUNT][2] = {{0, straight},  {corner, corner},   {straight, 0},  {corner, -corner},
                                            {0, -straight}, {-corner, -corner}, {-straight, 0}, {-corner, corner}};
-    draw_outline(plot, points, color);
+    POINT gate[NOTCH_COUNT + 1];
+    for (int i = 0; i <= NOTCH_COUNT; ++i) {
+        gate[i] = {plot.px(points[i % NOTCH_COUNT][0]), plot.py(points[i % NOTCH_COUNT][1])};
+    }
+    SetDCPenColor(plot.dc, color);
+    Polyline(plot.dc, gate, NOTCH_COUNT + 1);
 }
 
 // A ring that reads on every zone color (dark outside, white inside, as in pyESS), and the port
@@ -1005,47 +1033,42 @@ static void draw_dot(const Plot& plot, int port, double x, double y) {
     TextOutA(plot.dc, cx + 8, cy - 18, label.c_str(), static_cast<int>(label.size()));
 }
 
-// The zone legend, under the game plot: a swatch and a name per zone.
+// The zone legend, beside the game plot: a swatch and a name per zone.
 static void draw_legend(const Plot& plot) {
     SetTextColor(plot.dc, COLOR_TEXT);
     for (size_t i = 0; i < std::size(ZONE_NAMES); ++i) {
-        const int y = plot.h + 10 + 20 * static_cast<int>(i);
-        fill(plot.dc, {0, y + 2, 14, y + 16}, ZONE_COLORS[i]);
-        frame(plot.dc, {0, y + 2, 14, y + 16}, COLOR_BORDER);
-        TextOutA(plot.dc, 22, y, ZONE_NAMES[i], static_cast<int>(std::strlen(ZONE_NAMES[i])));
+        const int x = plot.w + 12, y = 20 * static_cast<int>(i);
+        fill(plot.dc, {x, y + 2, x + 14, y + 16}, ZONE_COLORS[i]);
+        frame(plot.dc, {x, y + 2, x + 14, y + 16}, COLOR_BORDER);
+        TextOutA(plot.dc, x + 22, y, ZONE_NAMES[i], static_cast<int>(std::strlen(ZONE_NAMES[i])));
     }
 }
 
-// The settings and calibration a zone map is made from, as a key.
-static std::vector<int> zone_map_key(int port, const NotchCalibration& cal, const StickSettings& settings) {
-    std::vector<int> key = {port,          static_cast<int>(settings.game), settings.ess,  settings.snap_distance, settings.range_start,
-                            settings.range_end, settings.dead_zone_distance,      cal.valid};
-    for (int i = 0; i < NOTCH_COUNT; ++i) {
-        key.insert(key.end(), {cal.notch[i][0], cal.notch[i][1], cal.offset[i][0], cal.offset[i][1]});
-    }
-    return key;
+// The settings a zone map is made from, as a key.
+static std::vector<int> zone_map_key(int port, const StickSettings& settings) {
+    return {port, static_cast<int>(settings.game), settings.ess, settings.range_start, settings.range_end, settings.dead_zone_distance};
 }
 
 static void paint_plots(HDC target) {
-    AdapterFrame raw, centered;
-    NotchCalibration notches[PORT_COUNT];
+    AdapterFrame raw, centered, calibrated;
     {
         std::lock_guard lock(g_mutex);
         raw = g_raw;
         centered = g_centered;
-        std::copy(std::begin(g_notches), std::end(g_notches), notches);
+        calibrated = g_calibrated;
     }
     const int port = map_port(raw);
-    const NotchCalibration& cal = notches[port];
     const StickSettings settings = stick_settings(port);
 
-    // Your stick: every stick position, as the bridge loop centers it, colored by what it does in
-    // game through the whole path. Made again only when a setting or the calibration changes.
+    // Your stick, after notch calibration, so the ideal gate and the zones line up with it: every
+    // stick position colored by what it does in game, through the rest of the path (ESS range,
+    // dead zone, ESS map, the pass that keeps axes moving with their input, and the game). Made
+    // again only when a setting changes.
     static ZoneImage stick_zones;
-    if (const std::vector<int> key = zone_map_key(port, cal, settings); key != stick_zones.key) {
+    if (const std::vector<int> key = zone_map_key(port, settings); key != stick_zones.key) {
         make_zone_image(stick_zones, STICK_PLOT_SIZE, STICK_PLOT_SIZE, STICK_PLOT_RANGE, [&](int x, int y) {
             uint8_t s[2] = {static_cast<uint8_t>(std::clamp(128 + x, 0, 255)), static_cast<uint8_t>(std::clamp(128 + y, 0, 255))};
-            process_stick(s, cal, settings);
+            process_stick(s, NotchCalibration{}, settings);  // already calibrated: no warp, no snapping
             int in_game[2];
             game_in_game(settings.game, s[0], s[1], in_game);
             return oot_zone(in_game[0], in_game[1]);
@@ -1055,12 +1078,7 @@ static void paint_plots(HDC target) {
     draw_plot(target, STICK_PLOT, 0, [&](const Plot& plot) {
         draw_zone_image(plot, stick_zones);
         draw_axes(plot);
-        // The gate: the calibrated notches if there are any, else the stock Gamecube gate.
-        if (cal.valid) {
-            draw_outline(plot, cal.notch, COLOR_TEXT);
-        } else {
-            draw_gate(plot, GATE_STRAIGHT, GATE_DIAGONAL, COLOR_TEXT);
-        }
+        draw_gate(plot, GATE_STRAIGHT, GATE_DIAGONAL, COLOR_TEXT);
 
         // While calibrating, a ring around where the stick should go for the current step:
         // the ideal notch, or the center for a neutral step.
@@ -1077,9 +1095,11 @@ static void paint_plots(HDC target) {
             DeleteObject(pen);
         }
 
+        // A port that is calibrating shows its raw stick instead, to match the pink target ring.
         for (int p = 0; p < PORT_COUNT; ++p) {
             if (raw[p].connected) {
-                draw_dot(plot, p, centered[p].stick[0] - 128, centered[p].stick[1] - 128);
+                const GCPortState& shown = p == g_calibrating_port ? centered[p] : calibrated[p];
+                draw_dot(plot, p, shown.stick[0] - 128, shown.stick[1] - 128);
             }
         }
     });
@@ -1094,14 +1114,14 @@ static void paint_plots(HDC target) {
     AdapterFrame out;
     {
         std::lock_guard lock(g_mutex);
-        out = g_out;
+        out = game_has_now();  // with input lag, the dots lag behind the stick like the game does
     }
-    draw_plot(target, GAME_PLOT, LEGEND_HEIGHT, [&](const Plot& plot) {
+    draw_plot(target, GAME_PLOT, LEGEND_WIDTH, [&](const Plot& plot) {
         draw_zone_image(plot, game_zones);
         draw_axes(plot);
         draw_gate(plot, N64_STRAIGHT, N64_DIAGONAL, COLOR_TEXT);
         for (int p = 0; p < PORT_COUNT; ++p) {
-            if (raw[p].connected) {
+            if (out[p].connected) {
                 int in_game[2];
                 game_in_game(g_game, out[p].stick[0], out[p].stick[1], in_game);
                 draw_dot(plot, p, in_game[0], in_game[1]);
@@ -1290,7 +1310,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         add_control(hwnd, "STATIC", "", 0, STICK_PLOT.left, STICK_PLOT.top - 20, 250, 18, ID_STICK_PLOT_TITLE);
         add_control(hwnd, "STATIC", "", 0, GAME_PLOT.left, GAME_PLOT.top - 20, 250, 18, ID_GAME_PLOT_TITLE);
         add_control(hwnd, "STATIC", "", 0, 10, SETTINGS_BOTTOM_Y + 4, 410, 18, ID_PROMPT);
-        add_control(hwnd, "BUTTON", "Done", BS_OWNERDRAW, GAME_PLOT.right - 100, SETTINGS_BOTTOM_Y, 100, 24, ID_DONE);
+        add_control(hwnd, "BUTTON", "Done", BS_OWNERDRAW, SETTINGS_WIDTH - 110, SETTINGS_BOTTOM_Y, 100, 24, ID_DONE);
         refresh_settings(hwnd);
         return 0;
     case WM_PAINT: {
@@ -1519,7 +1539,7 @@ static void open_settings(HWND owner) {
     }
     g_editing = true;
     g_settings_window = create_fixed_window(SETTINGS_CLASS, "Software ESS Adapter settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                                            GAME_PLOT.right + 10, SETTINGS_BOTTOM_Y + 34, owner);
+                                            SETTINGS_WIDTH, SETTINGS_BOTTOM_Y + 34, owner);
     ShowWindow(g_settings_window, SW_SHOW);
 }
 

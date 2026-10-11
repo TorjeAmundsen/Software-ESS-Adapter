@@ -67,7 +67,9 @@ int stock_in_game(Game game, int distance);
 int physical_start(Game game, int in_game);
 // Last physical distance where the stock map does not go past `in_game` (end of the range).
 int physical_end(Game game, int in_game);
-// Largest in-game end the settings allow.
+// Largest in-game end the settings allow: 45, as on ElectroModder's adapter, the reference for
+// ESS adapters.
+constexpr int ESS_IN_GAME_MAX_END = 45;
 int max_in_game_end(Game game);
 
 // Software dead zone, in the same in-game units as the ESS range: N covers where the stick would
@@ -87,5 +89,7 @@ void apply_dead_zone(uint8_t stick[2], double distance);
 
 // Requires 1 <= start < end <= ESS_MAX_END, in physical distances. Distances below start
 // become dead zone, [start, end] becomes ESS, and above end is stretched out to full tilt
-// (105), which stays where it is.
+// (105), which stays where it is. Start and end are cardinal distances. In other directions they
+// scale with where the stock map's ESS starts and ends there, so the range keeps the stock map's
+// ESS shape all the way around.
 void remap_ess_range(Game game, uint8_t stick[2], int start, int end);
