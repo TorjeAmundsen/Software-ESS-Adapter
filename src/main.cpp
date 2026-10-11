@@ -3,7 +3,7 @@
 //The Following code is released under GNU GENERAL PUBLIC LICENSE Version 3.
 
 // Software ESS Adapter: reads a Gamecube adapter, applies the ESS map from this
-// repository, and serves the result to Dolphin as a DSU controller.
+// repository, and serves the result to Dolphin or Ship of Harkinian as a DSU controller.
 
 #include <winsock2.h>
 #include <windows.h>
@@ -16,12 +16,15 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "delayed_sender.hpp"
 #include "dsu_server.hpp"
 #include "ess.hpp"
 #include "ess_range.hpp"
@@ -34,6 +37,14 @@
 static constexpr DWORD DWM_USE_IMMERSIVE_DARK_MODE = 20;  // DWMWA_USE_IMMERSIVE_DARK_MODE
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+// Ship of Harkinian output and input lag are only in dev builds (.uild.ps1 --dev) until SoH's DSU
+// input is in an official libultraship release. Without them the program always plays on Wii VC.
+#ifdef SOH_DEV
+static constexpr bool SOH_FEATURES = true;
+#else
+static constexpr bool SOH_FEATURES = false;
 #endif
 
 enum ControlId {
@@ -76,6 +87,14 @@ enum ControlId {
     ID_OFFSETS_PROMPT,
     ID_OFFSETS_RESET,
     ID_OFFSETS_DONE,
+    ID_GAME_LABEL,
+    ID_GAME_VC,   // "Playing on" choices, drawn as a pair of toggle buttons
+    ID_GAME_SOH,
+    ID_LAG_LABEL,
+    ID_LAG_MINUS,
+    ID_LAG_VALUE,
+    ID_LAG_PLUS,
+    ID_LAG_HINT,
     ID_ESS_CHECK = 200,
     ID_CALIBRATE = 300,
     ID_PORT_TEXT = 400,
@@ -96,34 +115,39 @@ static const COLORREF COLOR_FACE = RGB(55, 55, 55);
 static const COLORREF COLOR_FACE_DOWN = RGB(80, 80, 80);
 static const COLORREF COLOR_BORDER = RGB(95, 95, 95);
 static const COLORREF COLOR_ACCENT = RGB(0, 120, 215);
-static const COLORREF COLOR_PLOT_BG = RGB(24, 24, 24);
-static const COLORREF COLOR_PLOT_AXIS = RGB(50, 50, 50);
-static const COLORREF COLOR_DEAD_ZONE = RGB(70, 70, 70);
-static const COLORREF COLOR_ESS_RANGE = RGB(0, 70, 125);
+static const COLORREF COLOR_PLOT_AXIS = RGB(138, 138, 138);
 static const COLORREF COLOR_DOT_IN_RANGE = RGB(80, 200, 255);
-static const COLORREF COLOR_FULL_SPEED = RGB(150, 110, 40);
-static const COLORREF COLOR_SOFTWARE_DEAD_ZONE = RGB(110, 110, 110);
-static const COLORREF COLOR_CALIBRATION_TARGET = RGB(90, 210, 120);
+static const COLORREF COLOR_CALIBRATION_TARGET = RGB(255, 80, 200);  // pink, apart from the zone colors
+// The plots color everything by what OoT does with it, in OotZone order: only ESS in color, the
+// movement zones in grays that get darker as Link speeds up.
+static const COLORREF ZONE_COLORS[] = {RGB(0x1A, 0x1A, 0x1A), RGB(0x3F, 0xBF, 0x6F), RGB(0x5C, 0x5C, 0x5C), RGB(0x46, 0x46, 0x46),
+                                       RGB(0x32, 0x32, 0x32)};
+static const char* const ZONE_NAMES[] = {"Dead zone", "ESS (turn in place)", "Walk", "Run", "Full speed"};
 static const COLORREF COLOR_ACTIVE = RGB(60, 200, 90);
 static const COLORREF COLOR_PAUSED = RGB(230, 170, 50);
 
 // Status indicator in the main window's top right corner: amber "Paused" while the settings
-// window is open (Dolphin only gets a neutral controller), green "Active" while controller data
-// is going out to Dolphin, gray "Idle" otherwise.
+// window is open (the game only gets a neutral controller), green "Active" while controller data
+// is going out to the game, gray "Idle" otherwise.
 enum class LinkState { Idle, Active, Paused };
 static const int MAIN_RIGHT_X = 350;   // the indicator and the About button
 static const int MAIN_BOTTOM_Y = 176;  // the Edit settings / About row
 static const RECT ACTIVE_RECT = {MAIN_RIGHT_X, 10, MAIN_RIGHT_X + 70, 28};
 static LinkState g_shown_state = LinkState::Idle;
 
-// Plots in the settings window: the physical stick, and what OoT receives.
-static const RECT STICK_PLOT = {10, 252, 266, 508};
-static const RECT GAME_PLOT = {276, 252, 532, 508};
-static constexpr double STICK_PLOT_SCALE = 1.05;                              // pixels per Gamecube stick unit; fits a ring at 105 + 12
-static constexpr int N64_STRAIGHT = 80, N64_DIAGONAL = 70;                    // the N64 stick range, drawn on the game plot
-static constexpr double GAME_PLOT_SCALE = 1.5;                                // pixels per in-game unit
-static constexpr int LEGEND_HEIGHT = 62;                                      // below each plot, so it covers nothing
-static const int SETTINGS_BOTTOM_Y = STICK_PLOT.bottom + LEGEND_HEIGHT + 23;  // the prompt line and Done
+// Plots in the settings window: the physical stick, and what OoT receives, both at the same
+// scale, and the zone legend beside the game plot.
+static constexpr int PLOT_SCALE = 1;                         // pixels per unit, stick or in-game
+static constexpr int STICK_PLOT_RANGE = 118;                 // stick units from center to edge; fits a ring at 105 + 12
+static constexpr int GAME_PLOT_RANGE = 90;                   // in-game units from center to edge; fits SoH's 85
+static constexpr int N64_STRAIGHT = 80, N64_DIAGONAL = 70;   // the N64 stick range, drawn on the game plot
+static constexpr int LEGEND_WIDTH = 150;                     // beside the game plot: a row per zone
+static constexpr int STICK_PLOT_SIZE = 2 * PLOT_SCALE * STICK_PLOT_RANGE, GAME_PLOT_SIZE = 2 * PLOT_SCALE * GAME_PLOT_RANGE;
+static constexpr int PLOTS_TOP = SOH_FEATURES ? 312 : 252;  // under the settings rows (two more in dev builds)
+static const RECT STICK_PLOT = {10, PLOTS_TOP, 10 + STICK_PLOT_SIZE, PLOTS_TOP + STICK_PLOT_SIZE};
+static const RECT GAME_PLOT = {STICK_PLOT.right + 10, PLOTS_TOP, STICK_PLOT.right + 10 + GAME_PLOT_SIZE, PLOTS_TOP + GAME_PLOT_SIZE};
+static const int SETTINGS_BOTTOM_Y = STICK_PLOT.bottom + 12;  // the prompt line and Done
+static const int SETTINGS_WIDTH = std::max<int>(548, GAME_PLOT.right + LEGEND_WIDTH + 10);  // fits the settings rows too
 static const char* const SETTINGS_CLASS = "SoftwareESSAdapterSettings";
 static const char* const ABOUT_CLASS = "SoftwareESSAdapterAbout";
 static const char* const OFFSETS_CLASS = "SoftwareESSAdapterOffsets";
@@ -132,10 +156,14 @@ static const char* const SOURCE_URL = "https://github.com/TorjeAmundsen/Software
 static DsuServer g_dsu;
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_ess[PORT_COUNT] = {true, true, true, true};
+static std::atomic<Game> g_game{Game::WiiVC};
+// Input lag added on Ship of Harkinian, in milliseconds (see delayed_sender.hpp).
+static constexpr int MAX_INPUT_LAG_MS = 100;
+static std::atomic<int> g_input_lag{0};
 static std::atomic<int> g_snap_distance{DEFAULT_SNAP_DISTANCE};
 // ESS range as the user sets it, in in-game units, and the physical stick distances that
 // gives (see ess_range.hpp). The distances are recomputed whenever the setting changes.
-static std::atomic<int> g_range_start{ESS_IN_GAME_START};
+static std::atomic<int> g_range_start{default_ess_start(Game::WiiVC)};
 static std::atomic<int> g_range_end{ESS_IN_GAME_END};
 // Start and end distances packed into one atomic, so the bridge thread never reads a new start
 // with an old end.
@@ -151,8 +179,8 @@ static RangeDistances range_distances() {
 }
 
 static void update_range_distances() {
-    const int start = physical_start(g_range_start);
-    const int end = std::max(physical_end(g_range_end), start + 1);
+    const int start = physical_start(g_game, g_range_start);
+    const int end = std::max(physical_end(g_game, g_range_end), start + 1);
     g_range_distances = static_cast<uint32_t>(start) << 16 | static_cast<uint32_t>(end);
 }
 
@@ -167,7 +195,7 @@ static std::atomic<int> g_calibration_request{NO_REQUEST};
 static std::atomic<int> g_calibrating_port{-1};  // -1 when not calibrating
 // Speedrun rules forbid learning more about the controller than looking at it would tell you.
 // So settings, stick readouts, and plots live in a separate settings window, and while it is
-// open Dolphin gets a neutral controller instead of real input.
+// open the game gets a neutral controller instead of real input.
 static std::atomic<bool> g_editing{false};
 static HWND g_settings_window = nullptr;
 static HWND g_about_window = nullptr;
@@ -177,11 +205,17 @@ static int g_offsets_port = 0;
 static int g_held_notch = -1;  // the notch the stick is on, highlighted in that window, or -1
 static std::atomic<int> g_calibration_step{0};  // 0 to CALIBRATION_STEPS - 1, see notch.hpp
 
-static std::mutex g_mutex;  // guards the six below
+static std::mutex g_mutex;  // guards the seven below
 static AdapterFrame g_raw{};
 static AdapterFrame g_centered{};    // raw, centered on the origin
 static AdapterFrame g_calibrated{};  // after notch warp and snapping, before the ESS range and dead zone
 static AdapterFrame g_out{};
+// Recent g_out frames with when they were made, so the "In game" plot can lag like the game does.
+struct TimedFrame {
+    std::chrono::steady_clock::time_point at;
+    AdapterFrame frame;
+};
+static std::deque<TimedFrame> g_out_history;
 static std::string g_adapter_status = "Starting";
 static std::string g_notice;  // shown in the settings window's prompt line for a few seconds
 static std::chrono::steady_clock::time_point g_notice_time;
@@ -226,6 +260,8 @@ static bool read_ints(const std::string& path, const std::string& section, const
 
 // Settings file keys, named once so loading and saving can't drift apart.
 static const char* const SETTINGS_SECTION = "Settings";
+static const char* const KEY_GAME = "Game";  // 0 = Wii VC, 1 = Ship of Harkinian
+static const char* const KEY_INPUT_LAG = "InputLagMs";
 static const char* const KEY_SNAP_DISTANCE = "SnapDistance";
 static const char* const KEY_RANGE_START = "EssStartInGame";
 static const char* const KEY_RANGE_END = "EssEndInGame";
@@ -239,11 +275,12 @@ static const char* const KEY_NOTCH_OFFSETS = "NotchOffsets";  // per port
 // distances derived from them. Runs after loading and after every change.
 static void apply_settings() {
     g_snap_distance = std::clamp<int>(g_snap_distance, 0, MAX_SNAP_DISTANCE);
-    g_range_end = std::clamp<int>(g_range_end, 2, max_in_game_end());
+    g_input_lag = std::clamp<int>(g_input_lag, 0, MAX_INPUT_LAG_MS);
+    g_range_end = std::clamp<int>(g_range_end, 2, max_in_game_end(g_game));
     g_range_start = std::clamp<int>(g_range_start, 1, g_range_end - 1);
     g_dead_zone = std::clamp<int>(g_dead_zone, 0, g_range_start - 1);
     update_range_distances();
-    g_dead_zone_distance = physical_dead_zone(g_dead_zone);
+    g_dead_zone_distance = physical_dead_zone(g_game, g_dead_zone);
 }
 
 static void save_settings() {
@@ -251,6 +288,10 @@ static void save_settings() {
     auto write = [&](const char* key, int value) {
         WritePrivateProfileStringA(SETTINGS_SECTION, key, std::to_string(value).c_str(), path.c_str());
     };
+    if (SOH_FEATURES) {
+        write(KEY_GAME, g_game == Game::SoH ? 1 : 0);
+        write(KEY_INPUT_LAG, g_input_lag);
+    }
     write(KEY_SNAP_DISTANCE, g_snap_distance);
     write(KEY_RANGE_START, g_range_start);
     write(KEY_RANGE_END, g_range_end);
@@ -262,8 +303,11 @@ static void load_settings() {
     auto read = [&](const char* key, int fallback) {
         return static_cast<int>(GetPrivateProfileIntA(SETTINGS_SECTION, key, fallback, path.c_str()));
     };
+    // A settings file from a dev build may still say SoH; other builds leave it alone and play on VC.
+    g_game = SOH_FEATURES && read(KEY_GAME, 0) == 1 ? Game::SoH : Game::WiiVC;
+    g_input_lag = SOH_FEATURES ? read(KEY_INPUT_LAG, 0) : 0;
     g_snap_distance = read(KEY_SNAP_DISTANCE, DEFAULT_SNAP_DISTANCE);
-    g_range_start = read(KEY_RANGE_START, ESS_IN_GAME_START);
+    g_range_start = read(KEY_RANGE_START, default_ess_start(g_game));
     g_range_end = read(KEY_RANGE_END, ESS_IN_GAME_END);
     g_dead_zone = read(KEY_DEAD_ZONE, DEAD_ZONE_DEFAULT);
     apply_settings();
@@ -343,8 +387,21 @@ static const char* limit_reason(int id) {
         }
         return nullptr;
     }
-    const int snap = g_snap_distance, start = g_range_start, end = g_range_end, dead_zone = g_dead_zone;
+    const int snap = g_snap_distance, start = g_range_start, end = g_range_end, dead_zone = g_dead_zone, lag = g_input_lag;
     switch (id) {
+    case ID_LAG_MINUS:
+    case ID_LAG_PLUS:
+        if (g_game != Game::SoH) {
+            return "Input lag only applies to Ship of Harkinian, to match how Dolphin feels.";
+        }
+        if (id == ID_LAG_MINUS) {
+            return lag == 0 ? "Input lag is already off." : nullptr;
+        }
+        if (lag == MAX_INPUT_LAG_MS) {
+            static const std::string reason = "Input lag goes up to " + std::to_string(MAX_INPUT_LAG_MS) + " ms.";
+            return reason.c_str();
+        }
+        return nullptr;
     case ID_SNAP_MINUS:
         return snap == 0 ? "Notch snapping is already off." : nullptr;
     case ID_SNAP_PLUS:
@@ -364,7 +421,12 @@ static const char* limit_reason(int id) {
     case ID_RANGE_END_MINUS:
         return end == start + 1 ? "The ESS range end must stay above the start." : nullptr;
     case ID_RANGE_END_PLUS:
-        return end == max_in_game_end() ? "The ESS range end can't go any higher." : nullptr;
+        if (end == max_in_game_end(g_game)) {
+            static const std::string reason =
+                "The ESS range end goes up to " + std::to_string(ESS_IN_GAME_MAX_END) + ", as on ElectroModder's adapter.";
+            return reason.c_str();
+        }
+        return nullptr;
     case ID_DEAD_ZONE_MINUS:
         return dead_zone == 0 ? "The software dead zone is already off." : nullptr;
     case ID_DEAD_ZONE_PLUS:
@@ -381,7 +443,8 @@ struct Stepper {
 static const Stepper STEPPERS[] = {{ID_SNAP_MINUS, ID_SNAP_PLUS, &g_snap_distance},
                                    {ID_RANGE_START_MINUS, ID_RANGE_START_PLUS, &g_range_start},
                                    {ID_RANGE_END_MINUS, ID_RANGE_END_PLUS, &g_range_end},
-                                   {ID_DEAD_ZONE_MINUS, ID_DEAD_ZONE_PLUS, &g_dead_zone}};
+                                   {ID_DEAD_ZONE_MINUS, ID_DEAD_ZONE_PLUS, &g_dead_zone},
+                                   {ID_LAG_MINUS, ID_LAG_PLUS, &g_input_lag}};
 
 static void set_notice(const std::string& text) {
     std::lock_guard lock(g_mutex);
@@ -426,10 +489,37 @@ static void set_adapter_status(const std::string& status) {
     g_adapter_status = status;
 }
 
+// The program the controller goes to, for status lines and prompts.
+static const char* client_name() {
+    return g_game == Game::SoH ? "Ship of Harkinian" : "Dolphin";
+}
+
+// The input lag to add right now: only on Ship of Harkinian.
+static std::chrono::microseconds input_lag() {
+    return std::chrono::milliseconds(g_game == Game::SoH ? g_input_lag.load() : 0);
+}
+
+// What the game has right now: g_out from the input lag ago, or the oldest kept if the lag is
+// longer than the history so far. Call with g_mutex held.
+static AdapterFrame game_has_now() {
+    const auto lag = input_lag();
+    if (lag.count() == 0 || g_out_history.empty()) {
+        return g_out;
+    }
+    const auto due = std::chrono::steady_clock::now() - lag;
+    for (auto it = g_out_history.rbegin(); it != g_out_history.rend(); ++it) {
+        if (it->at <= due) {
+            return it->frame;
+        }
+    }
+    return g_out_history.front().frame;
+}
+
 // The stick settings for a port, as they are right now.
 static StickSettings stick_settings(int port) {
     const RangeDistances range = range_distances();
     StickSettings settings;
+    settings.game = g_game;
     settings.ess = g_ess[port];
     settings.snap_distance = g_snap_distance;
     settings.range_start = range.start;
@@ -458,6 +548,8 @@ static void bridge_loop() {
     bool has_origin[PORT_COUNT] = {};
     bool prev_a[PORT_COUNT] = {}, prev_b[PORT_COUNT] = {};
     uint8_t samples[CALIBRATION_STEPS][2] = {};  // raw stick per calibration step
+    // Everything goes out through here, so input lag delays it all, disconnects included.
+    DelayedSender sender([](const AdapterFrame& frame, Game game) { g_dsu.publish(frame, game); });
 
     auto take_calibration_request = [] {
         const int request = g_calibration_request.exchange(NO_REQUEST);
@@ -471,9 +563,10 @@ static void bridge_loop() {
     auto forget_controllers = [&] {
         raw = {};
         std::fill(std::begin(has_origin), std::end(has_origin), false);
-        g_dsu.publish(AdapterFrame{});  // reports every port as disconnected
+        sender.push(AdapterFrame{}, g_game, input_lag());  // reports every port as disconnected
         std::lock_guard lock(g_mutex);
         g_raw = g_centered = g_calibrated = g_out = AdapterFrame{};
+        g_out_history.clear();
     };
     auto wait = [&](int ms) {
         for (int waited = 0; waited < ms && g_running; waited += 100) {
@@ -584,18 +677,26 @@ static void bridge_loop() {
             prev_a[p] = a;
             prev_b[p] = b;
         }
-        g_dsu.publish(sent);
+        sender.push(sent, g_game, input_lag());
 
         std::lock_guard lock(g_mutex);
         g_raw = raw;
         g_centered = centered;
         g_calibrated = calibrated;
         g_out = out;
+        const auto now = std::chrono::steady_clock::now();
+        g_out_history.push_back({now, out});
+        while (g_out_history.front().at < now - std::chrono::milliseconds(MAX_INPUT_LAG_MS + 50)) {
+            g_out_history.pop_front();
+        }
         g_adapter_status = "Adapter connected";
     }
 }
 
 static void set_text(HWND hwnd, int id, const std::string& text) {
+    if (!GetDlgItem(hwnd, id)) {
+        return;  // a control only dev builds have
+    }
     char current[256];
     GetDlgItemTextA(hwnd, id, current, sizeof(current));
     if (text != current) {
@@ -615,7 +716,12 @@ static void refresh_main(HWND hwnd) {
     }
     set_text(hwnd, ID_ADAPTER_STATUS, status);
     if (g_dsu.last_error().empty()) {
-        set_text(hwnd, ID_DSU_STATUS, g_dsu.client_count() > 0 ? "Dolphin connected." : "Waiting for Dolphin to connect.");
+        const std::string name = client_name();
+        std::string text = g_dsu.client_count() > 0 ? name + " connected." : "Waiting for " + name + " to connect.";
+        if (input_lag().count() > 0) {
+            text += " Input lag " + std::to_string(g_input_lag) + " ms.";
+        }
+        set_text(hwnd, ID_DSU_STATUS, text);
     }
     for (int p = 0; p < PORT_COUNT; ++p) {
         set_text(hwnd, ID_MAIN_PORT + p,
@@ -660,6 +766,16 @@ static void paint_active_indicator(HDC dc) {
     SelectObject(dc, old_font);
 }
 
+// The port whose zone map the stick plot shows: the first one with a controller.
+static int map_port(const AdapterFrame& raw) {
+    for (int p = 0; p < PORT_COUNT; ++p) {
+        if (raw[p].connected) {
+            return p;
+        }
+    }
+    return 0;
+}
+
 static void refresh_settings(HWND hwnd) {
     AdapterFrame raw, centered, out;
     bool calibrated[PORT_COUNT];
@@ -668,7 +784,7 @@ static void refresh_settings(HWND hwnd) {
         std::lock_guard lock(g_mutex);
         raw = g_raw;
         centered = g_centered;
-        out = g_out;
+        out = game_has_now();  // the Game readout lags like the game
         for (int p = 0; p < PORT_COUNT; ++p) {
             calibrated[p] = g_notches[p].valid;
         }
@@ -682,9 +798,9 @@ static void refresh_settings(HWND hwnd) {
         std::string text = "No controller";
         if (raw[p].connected) {
             // Stick convention: neutral is 0, 0, right and up are positive. "Game" is what OoT
-            // sees after Wii VC. Fixed-width fields in a monospace font so nothing shifts.
+            // sees after Wii VC or SoH. Fixed-width fields in a monospace font so nothing shifts.
             int in_game[2];
-            vc_in_game(out[p].stick[0] - 128, out[p].stick[1] - 128, in_game);
+            game_in_game(g_game, out[p].stick[0], out[p].stick[1], in_game);
             char buffer[64];
             std::snprintf(buffer, sizeof(buffer), "Stick %4d,%4d  Game %3d,%3d", centered[p].stick[0] - 128, centered[p].stick[1] - 128,
                           in_game[0], in_game[1]);
@@ -707,21 +823,25 @@ static void refresh_settings(HWND hwnd) {
     set_text(hwnd, ID_RANGE_START_VALUE, std::to_string(g_range_start));
     set_text(hwnd, ID_RANGE_END_VALUE, std::to_string(g_range_end));
     set_text(hwnd, ID_DEAD_ZONE_VALUE, std::to_string(g_dead_zone));
+    set_text(hwnd, ID_LAG_VALUE, std::to_string(g_input_lag));
     // Repaint a -/+ button when it reaches or leaves its limit (it looks dimmed there).
     static bool shown_at_limit[std::size(STEPPERS) * 2] = {};
     size_t button = 0;
     for (const Stepper& stepper : STEPPERS) {
         for (const int id : {stepper.minus, stepper.plus}) {
             const bool at_limit = limit_reason(id) != nullptr;
-            if (at_limit != shown_at_limit[button]) {
+            HWND control = GetDlgItem(hwnd, id);  // null for a button only dev builds have
+            if (control && at_limit != shown_at_limit[button]) {
                 shown_at_limit[button] = at_limit;
-                InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
+                InvalidateRect(control, nullptr, TRUE);
             }
             ++button;
         }
     }
 
-    std::string prompt = notice.empty() ? "Dolphin gets a neutral controller until you close this window." : notice;
+    set_text(hwnd, ID_STICK_PLOT_TITLE, "Your stick, port " + std::to_string(map_port(raw) + 1));
+    set_text(hwnd, ID_GAME_PLOT_TITLE, g_game == Game::SoH ? "In game (OoT on Ship of Harkinian)" : "In game (OoT on Wii VC)");
+    std::string prompt = notice.empty() ? std::string(client_name()) + " gets a neutral controller until you close this window." : notice;
     if (calibrating >= 0) {
         const std::string port = std::to_string(calibrating + 1);
         const int step = g_calibration_step;
@@ -737,10 +857,9 @@ static void refresh_settings(HWND hwnd) {
         }
     }
     set_text(hwnd, ID_PROMPT, prompt);
-    for (const RECT& plot : {STICK_PLOT, GAME_PLOT}) {
-        const RECT with_legend = {plot.left, plot.top, plot.right, plot.bottom + LEGEND_HEIGHT};
-        InvalidateRect(hwnd, &with_legend, FALSE);
-    }
+    InvalidateRect(hwnd, &STICK_PLOT, FALSE);
+    const RECT game_with_legend = {GAME_PLOT.left, GAME_PLOT.top, GAME_PLOT.right + LEGEND_WIDTH, GAME_PLOT.bottom};
+    InvalidateRect(hwnd, &game_with_legend, FALSE);
 }
 
 static void fill(HDC dc, const RECT& rect, COLORREF color) {
@@ -785,6 +904,12 @@ static void draw_item(const DRAWITEMSTRUCT& item) {
         RECT label = rect;
         label.left += size + 6;
         DrawTextA(dc, text, -1, &label, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    } else if (id == ID_GAME_VC || id == ID_GAME_SOH) {
+        // The chosen game is filled in, like a checked ESS box.
+        const bool chosen = (id == ID_GAME_SOH) == (g_game == Game::SoH);
+        fill(dc, rect, chosen ? COLOR_ACCENT : (item.itemState & ODS_SELECTED) ? COLOR_FACE_DOWN : COLOR_FACE);
+        frame(dc, rect, chosen ? COLOR_ACCENT : COLOR_BORDER);
+        DrawTextA(dc, text, -1, &rect, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
     } else {
         fill(dc, rect, (item.itemState & ODS_SELECTED) ? COLOR_FACE_DOWN : COLOR_FACE);
         frame(dc, rect, COLOR_BORDER);
@@ -799,43 +924,89 @@ static void draw_item(const DRAWITEMSTRUCT& item) {
     }
 }
 
-// Off-screen canvas for one plot and its legend underneath, so the 60 Hz redraw doesn't
-// flicker. w and h are the plot square; the legend area follows below it.
+// Off-screen canvas for one plot (and the legend beside the game plot), so the 60 Hz redraw doesn't
+// flicker. w and h are the plot square; `beside` more columns follow to its right.
 struct Plot {
     HDC dc;
     int w, h;
-    double scale;  // pixels per stick unit
     int px(double x) const {
-        return w / 2 + static_cast<int>(std::lround(x * scale));
+        return w / 2 + static_cast<int>(std::lround(x * PLOT_SCALE));
     }
     int py(double y) const {
-        return h / 2 - static_cast<int>(std::lround(y * scale));
+        return h / 2 - static_cast<int>(std::lround(y * PLOT_SCALE));
     }
 };
 
 template <typename Draw>
-static void draw_plot(HDC target, const RECT& rect, double scale, Draw draw) {
-    Plot plot{CreateCompatibleDC(target), rect.right - rect.left, rect.bottom - rect.top, scale};
-    HBITMAP bitmap = CreateCompatibleBitmap(target, plot.w, plot.h + LEGEND_HEIGHT);
+static void draw_plot(HDC target, const RECT& rect, int beside, Draw draw) {
+    Plot plot{CreateCompatibleDC(target), rect.right - rect.left, rect.bottom - rect.top};
+    HBITMAP bitmap = CreateCompatibleBitmap(target, plot.w + beside, plot.h);
     HGDIOBJ old_bitmap = SelectObject(plot.dc, bitmap);
     HGDIOBJ old_pen = SelectObject(plot.dc, GetStockObject(DC_PEN));
     HGDIOBJ old_brush = SelectObject(plot.dc, GetStockObject(DC_BRUSH));
     HGDIOBJ old_font = SelectObject(plot.dc, g_font);
     SetBkMode(plot.dc, TRANSPARENT);
-    const RECT area = {0, 0, plot.w, plot.h};
-    fill(plot.dc, area, COLOR_PLOT_BG);
-    fill(plot.dc, {0, plot.h, plot.w, plot.h + LEGEND_HEIGHT}, COLOR_BG);
+    fill(plot.dc, {plot.w, 0, plot.w + beside, plot.h}, COLOR_BG);
 
     draw(plot);
 
-    frame(plot.dc, area, COLOR_BORDER);
-    BitBlt(target, rect.left, rect.top, plot.w, plot.h + LEGEND_HEIGHT, plot.dc, 0, 0, SRCCOPY);
+    frame(plot.dc, {0, 0, plot.w, plot.h}, COLOR_BORDER);
+    BitBlt(target, rect.left, rect.top, plot.w + beside, plot.h, plot.dc, 0, 0, SRCCOPY);
     SelectObject(plot.dc, old_font);
     SelectObject(plot.dc, old_brush);
     SelectObject(plot.dc, old_pen);
     SelectObject(plot.dc, old_bitmap);
     DeleteObject(bitmap);
     DeleteDC(plot.dc);
+}
+
+// A plot's background: every unit colored by its zone, PLOT_SCALE pixels square, with unit 0
+// under the axes. zone_at(x, y) gives the zone for a unit.
+struct ZoneImage {
+    std::vector<int> key;  // what it was made from, to know when to make it again
+    int w = 0, h = 0;
+    std::vector<uint32_t> pixels;  // top-down, 0x00RRGGBB
+};
+
+template <typename ZoneAt>
+static void make_zone_image(ZoneImage& image, int w, int h, int range, ZoneAt zone_at) {
+    uint32_t colors[std::size(ZONE_COLORS)];
+    for (size_t i = 0; i < std::size(ZONE_COLORS); ++i) {
+        colors[i] = GetRValue(ZONE_COLORS[i]) << 16 | GetGValue(ZONE_COLORS[i]) << 8 | GetBValue(ZONE_COLORS[i]);
+    }
+    const int span = 2 * range + 1;
+    std::vector<uint32_t> units(span * span);
+    for (int x = -range; x <= range; ++x) {
+        for (int y = -range; y <= range; ++y) {
+            units[(x + range) * span + (y + range)] = colors[static_cast<int>(zone_at(x, y))];
+        }
+    }
+    // Pixel column c shows the unit whose center Plot::px puts nearest to it, counting from w/2
+    // (likewise for rows, upward from h/2).
+    auto unit = [range](int offset) {
+        const int u = static_cast<int>(std::floor((offset + PLOT_SCALE / 2.0) / PLOT_SCALE));
+        return std::clamp(u, -range, range) + range;
+    };
+    image.w = w;
+    image.h = h;
+    image.pixels.resize(static_cast<size_t>(w) * h);
+    for (int r = 0; r < h; ++r) {
+        const int y = unit(h / 2 - r);
+        for (int c = 0; c < w; ++c) {
+            image.pixels[static_cast<size_t>(r) * w + c] = units[unit(c - w / 2) * span + y];
+        }
+    }
+}
+
+static void draw_zone_image(const Plot& plot, const ZoneImage& image) {
+    BITMAPINFO info = {};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = image.w;
+    info.bmiHeader.biHeight = -image.h;  // top-down
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    SetDIBitsToDevice(plot.dc, 0, 0, image.w, image.h, 0, 0, 0, image.h, image.pixels.data(), &info, DIB_RGB_COLORS);
 }
 
 static void draw_axes(const Plot& plot) {
@@ -858,73 +1029,79 @@ static void draw_gate(const Plot& plot, double straight, double corner, COLORREF
     Polyline(plot.dc, gate, NOTCH_COUNT + 1);
 }
 
-static void draw_dot(const Plot& plot, int port, double x, double y, bool highlight) {
-    SetDCPenColor(plot.dc, COLOR_PLOT_BG);
-    SetDCBrushColor(plot.dc, highlight ? COLOR_DOT_IN_RANGE : COLOR_TEXT);
-    const int cx = plot.px(x), cy = plot.py(y);
-    Ellipse(plot.dc, cx - 4, cy - 4, cx + 5, cy + 5);
+// A ring that reads on every zone color (dark outside, white inside, as in pyESS), and the port
+// number with a dark shadow.
+static void draw_dot(const Plot& plot, int port, double x, double y) {
+    const int cx = plot.px(x), cy = plot.py(y), r = 5;
+    HGDIOBJ old_brush = SelectObject(plot.dc, GetStockObject(NULL_BRUSH));
+    for (const auto& [color, width] : {std::pair<COLORREF, int>{RGB(0, 0, 0), 3}, {RGB(255, 255, 255), 1}}) {
+        HPEN pen = CreatePen(PS_SOLID, width, color);
+        HGDIOBJ old_pen = SelectObject(plot.dc, pen);
+        Ellipse(plot.dc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+        SelectObject(plot.dc, old_pen);
+        DeleteObject(pen);
+    }
+    SelectObject(plot.dc, old_brush);
     const std::string label = std::to_string(port + 1);
-    SetTextColor(plot.dc, COLOR_TEXT);
-    TextOutA(plot.dc, cx + 6, cy - 16, label.c_str(), static_cast<int>(label.size()));
+    SetTextColor(plot.dc, RGB(0, 0, 0));
+    TextOutA(plot.dc, cx + 9, cy - 17, label.c_str(), static_cast<int>(label.size()));
+    SetTextColor(plot.dc, RGB(255, 255, 255));
+    TextOutA(plot.dc, cx + 8, cy - 18, label.c_str(), static_cast<int>(label.size()));
 }
 
-// Legend under the plot: one colored swatch (or line) and label per row.
-struct LegendRow {
-    COLORREF color;
-    bool line;
-    std::string text;
-};
-
-static void draw_legend(const Plot& plot, const std::vector<LegendRow>& rows) {
+// The zone legend, beside the game plot: a swatch and a name per zone.
+static void draw_legend(const Plot& plot) {
     SetTextColor(plot.dc, COLOR_TEXT);
-    for (size_t i = 0; i < rows.size(); ++i) {
-        const int y = plot.h + 6 + 18 * static_cast<int>(i);
-        if (rows[i].line) {
-            fill(plot.dc, {2, y + 7, 12, y + 9}, rows[i].color);
-        } else {
-            fill(plot.dc, {2, y + 3, 12, y + 13}, rows[i].color);
-        }
-        TextOutA(plot.dc, 18, y, rows[i].text.c_str(), static_cast<int>(rows[i].text.size()));
+    for (size_t i = 0; i < std::size(ZONE_NAMES); ++i) {
+        const int x = plot.w + 12, y = 20 * static_cast<int>(i);
+        fill(plot.dc, {x, y + 2, x + 14, y + 16}, ZONE_COLORS[i]);
+        frame(plot.dc, {x, y + 2, x + 14, y + 16}, COLOR_BORDER);
+        TextOutA(plot.dc, x + 22, y, ZONE_NAMES[i], static_cast<int>(std::strlen(ZONE_NAMES[i])));
     }
 }
 
+// The settings a zone map is made from, as a key.
+static std::vector<int> zone_map_key(int port, const StickSettings& settings) {
+    return {port, static_cast<int>(settings.game), settings.ess, settings.range_start, settings.range_end, settings.dead_zone_distance};
+}
+
 static void paint_plots(HDC target) {
-    AdapterFrame raw, centered, calibrated, out;
+    AdapterFrame raw, centered, calibrated;
     {
         std::lock_guard lock(g_mutex);
         raw = g_raw;
         centered = g_centered;
         calibrated = g_calibrated;
-        out = g_out;
     }
-    const RangeDistances range = range_distances();
-    const int start = range.start, end = range.end;
+    const int port = map_port(raw);
+    const StickSettings settings = stick_settings(port);
 
-    // Physical stick: the dead zone and ESS range to scale, inside the Gamecube gate.
-    draw_plot(target, STICK_PLOT, STICK_PLOT_SCALE, [&](const Plot& plot) {
-        auto disk = [&](double r, COLORREF color) {
-            SetDCPenColor(plot.dc, color);
-            SetDCBrushColor(plot.dc, color);
-            Ellipse(plot.dc, plot.px(-r), plot.py(r), plot.px(r) + 1, plot.py(-r) + 1);
-        };
-        disk(end, COLOR_ESS_RANGE);
-        disk(start, COLOR_DEAD_ZONE);
-        if (g_dead_zone_distance > 0) {
-            // This plot is before the ESS range, where the dead zone has its unscaled size.
-            const double half = g_dead_zone_distance;
-            SetDCPenColor(plot.dc, COLOR_SOFTWARE_DEAD_ZONE);
-            SetDCBrushColor(plot.dc, COLOR_SOFTWARE_DEAD_ZONE);
-            Rectangle(plot.dc, plot.px(-half), plot.py(half), plot.px(half) + 1, plot.py(-half) + 1);
-        }
+    // Your stick, after notch calibration, so the ideal gate and the zones line up with it: every
+    // stick position colored by what it does in game, through the rest of the path (ESS range,
+    // dead zone, ESS map, the pass that keeps axes moving with their input, and the game). Made
+    // again only when a setting changes.
+    static ZoneImage stick_zones;
+    if (const std::vector<int> key = zone_map_key(port, settings); key != stick_zones.key) {
+        make_zone_image(stick_zones, STICK_PLOT_SIZE, STICK_PLOT_SIZE, STICK_PLOT_RANGE, [&](int x, int y) {
+            uint8_t s[2] = {static_cast<uint8_t>(std::clamp(128 + x, 0, 255)), static_cast<uint8_t>(std::clamp(128 + y, 0, 255))};
+            process_stick(s, NotchCalibration{}, settings);  // already calibrated: no warp, no snapping
+            int in_game[2];
+            game_in_game(settings.game, s[0], s[1], in_game);
+            return oot_zone(in_game[0], in_game[1]);
+        });
+        stick_zones.key = key;
+    }
+    draw_plot(target, STICK_PLOT, 0, [&](const Plot& plot) {
+        draw_zone_image(plot, stick_zones);
         draw_axes(plot);
-        draw_gate(plot, GATE_STRAIGHT, GATE_DIAGONAL, COLOR_BORDER);
+        draw_gate(plot, GATE_STRAIGHT, GATE_DIAGONAL, COLOR_TEXT);
 
         // While calibrating, a ring around where the stick should go for the current step:
         // the ideal notch, or the center for a neutral step.
         if (g_calibrating_port >= 0) {
             const int step = g_calibration_step;
-            const int8_t* target = is_neutral_step(step) ? nullptr : IDEAL_NOTCHES[notch_of_step(step)];
-            const double tx = target ? target[0] : 0, ty = target ? target[1] : 0, r = 12;
+            const int8_t* goal = is_neutral_step(step) ? nullptr : IDEAL_NOTCHES[notch_of_step(step)];
+            const double tx = goal ? goal[0] : 0, ty = goal ? goal[1] : 0, r = 12;
             HPEN pen = CreatePen(PS_SOLID, 2, COLOR_CALIBRATION_TARGET);
             HGDIOBJ old_pen = SelectObject(plot.dc, pen);
             HGDIOBJ old_brush = SelectObject(plot.dc, GetStockObject(NULL_BRUSH));
@@ -934,52 +1111,39 @@ static void paint_plots(HDC target) {
             DeleteObject(pen);
         }
 
+        // A port that is calibrating shows its raw stick instead, to match the pink target ring.
         for (int p = 0; p < PORT_COUNT; ++p) {
-            if (!raw[p].connected) {
-                continue;
+            if (raw[p].connected) {
+                const GCPortState& shown = p == g_calibrating_port ? centered[p] : calibrated[p];
+                draw_dot(plot, p, shown.stick[0] - 128, shown.stick[1] - 128);
             }
-            // The stick after notch calibration, so it lines up with the ESS range. A port that is
-            // calibrating shows its raw stick instead, to match the green target ring.
-            const GCPortState& shown = p == g_calibrating_port ? centered[p] : calibrated[p];
-            const int x = shown.stick[0] - 128, y = shown.stick[1] - 128;
-            const double r = std::sqrt(static_cast<double>(x * x + y * y));
-            draw_dot(plot, p, x, y, r >= start && r <= end);
         }
-        draw_legend(plot, {{COLOR_ESS_RANGE, false,
-                            "ESS range " + std::to_string(g_range_start) + " to " + std::to_string(g_range_end) + " in game"},
-                           {COLOR_DEAD_ZONE, false, "Game dead zone"},
-                           {COLOR_SOFTWARE_DEAD_ZONE, false, "Software dead zone (reads 0, 0)"}});
     });
 
-    // In game: OoT's own zones in the values it receives from VC. ESS is everything within 20
-    // of the dead zone square, so a rounded square; full speed is the same shape at 60.
-    draw_plot(target, GAME_PLOT, GAME_PLOT_SCALE, [&](const Plot& plot) {
-        auto rounded_square = [&](double half, double radius, COLORREF color, bool filled) {
-            SetDCPenColor(plot.dc, color);
-            SetDCBrushColor(plot.dc, color);
-            SelectObject(plot.dc, GetStockObject(filled ? DC_BRUSH : NULL_BRUSH));
-            const int diameter = static_cast<int>(std::lround(2 * radius * plot.scale));
-            RoundRect(plot.dc, plot.px(-half), plot.py(half), plot.px(half) + 1, plot.py(-half) + 1, diameter, diameter);
-            SelectObject(plot.dc, GetStockObject(DC_BRUSH));
-        };
-        // Half a unit past the last value in each zone, so whole values fall inside.
-        const double ess_radius = OOT_WALK_MAGNITUDE - 0.5;
-        rounded_square(OOT_DEAD_ZONE + ess_radius, ess_radius, COLOR_ESS_RANGE, true);
-        rounded_square(OOT_DEAD_ZONE + 0.5, 0, COLOR_DEAD_ZONE, true);
+    // In game: every in-game value colored by its zone, the N64's range, and where each port is.
+    static ZoneImage game_zones;
+    if (game_zones.pixels.empty()) {
+        make_zone_image(game_zones, GAME_PLOT_SIZE, GAME_PLOT_SIZE, GAME_PLOT_RANGE, [](int x, int y) {
+            return oot_zone(x, y);
+        });
+    }
+    AdapterFrame out;
+    {
+        std::lock_guard lock(g_mutex);
+        out = game_has_now();  // with input lag, the dots lag behind the stick like the game does
+    }
+    draw_plot(target, GAME_PLOT, LEGEND_WIDTH, [&](const Plot& plot) {
+        draw_zone_image(plot, game_zones);
         draw_axes(plot);
-        rounded_square(OOT_DEAD_ZONE + OOT_REL_MAX, OOT_REL_MAX, COLOR_FULL_SPEED, false);
-        draw_gate(plot, N64_STRAIGHT, N64_DIAGONAL, COLOR_BORDER);
+        draw_gate(plot, N64_STRAIGHT, N64_DIAGONAL, COLOR_TEXT);
         for (int p = 0; p < PORT_COUNT; ++p) {
-            if (!raw[p].connected) {
-                continue;
+            if (out[p].connected) {
+                int in_game[2];
+                game_in_game(g_game, out[p].stick[0], out[p].stick[1], in_game);
+                draw_dot(plot, p, in_game[0], in_game[1]);
             }
-            int in_game[2];
-            vc_in_game(out[p].stick[0] - 128, out[p].stick[1] - 128, in_game);
-            draw_dot(plot, p, in_game[0], in_game[1], oot_zone(in_game[0], in_game[1]) == OotZone::Ess);
         }
-        draw_legend(plot, {{COLOR_ESS_RANGE, false, "ESS (turn in place)"},
-                           {COLOR_DEAD_ZONE, false, "Game dead zone"},
-                           {COLOR_FULL_SPEED, true, "Full speed"}});
+        draw_legend(plot);
     });
 }
 
@@ -1065,8 +1229,14 @@ static void on_settings_command(HWND hwnd, int id) {
         }
     } else if (id >= ID_NOTCH_OFFSETS && id < ID_NOTCH_OFFSETS + PORT_COUNT) {
         open_offsets(hwnd, id - ID_NOTCH_OFFSETS);
+    } else if (id == ID_GAME_VC || id == ID_GAME_SOH) {
+        g_game = id == ID_GAME_SOH ? Game::SoH : Game::WiiVC;
+        apply_settings();
+        save_settings();
+        InvalidateRect(GetDlgItem(hwnd, ID_GAME_VC), nullptr, TRUE);
+        InvalidateRect(GetDlgItem(hwnd, ID_GAME_SOH), nullptr, TRUE);
     } else if (id == ID_RANGE_DEFAULT) {
-        g_range_start = ESS_IN_GAME_START;
+        g_range_start = default_ess_start(g_game);
         g_range_end = ESS_IN_GAME_END;
         g_dead_zone = DEAD_ZONE_DEFAULT;
         apply_settings();
@@ -1144,11 +1314,21 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
             add_control(hwnd, "STATIC", "Software dead zone", 0, label_x, 197, 130, 18, ID_DEAD_ZONE_LABEL);
             stepper(control_x, 194, ID_DEAD_ZONE_MINUS, ID_DEAD_ZONE_VALUE, ID_DEAD_ZONE_PLUS);
             add_dim_text(hwnd, "in game, 0 = off", hint_x, 197, 115, 18, ID_DEAD_ZONE_HINT);
+
+            if (SOH_FEATURES) {
+                add_control(hwnd, "STATIC", "Playing on", 0, label_x, 227, 130, 18, ID_GAME_LABEL);
+                add_control(hwnd, "BUTTON", "Dolphin (Wii VC)", BS_OWNERDRAW, control_x, 224, 130, 22, ID_GAME_VC);
+                add_control(hwnd, "BUTTON", "Ship of Harkinian", BS_OWNERDRAW, control_x + 134, 224, 130, 22, ID_GAME_SOH);
+
+                add_control(hwnd, "STATIC", "Input lag", 0, label_x, 257, 130, 18, ID_LAG_LABEL);
+                stepper(control_x, 254, ID_LAG_MINUS, ID_LAG_VALUE, ID_LAG_PLUS);
+                add_dim_text(hwnd, "ms, SoH only, 0 = off", hint_x, 257, 115, 18, ID_LAG_HINT);
+            }
         }
-        add_control(hwnd, "STATIC", "Your stick", 0, STICK_PLOT.left, STICK_PLOT.top - 20, 200, 18, ID_STICK_PLOT_TITLE);
-        add_control(hwnd, "STATIC", "In game (OoT on Wii VC)", 0, GAME_PLOT.left, GAME_PLOT.top - 20, 200, 18, ID_GAME_PLOT_TITLE);
+        add_control(hwnd, "STATIC", "", 0, STICK_PLOT.left, STICK_PLOT.top - 20, 250, 18, ID_STICK_PLOT_TITLE);
+        add_control(hwnd, "STATIC", "", 0, GAME_PLOT.left, GAME_PLOT.top - 20, 250, 18, ID_GAME_PLOT_TITLE);
         add_control(hwnd, "STATIC", "", 0, 10, SETTINGS_BOTTOM_Y + 4, 410, 18, ID_PROMPT);
-        add_control(hwnd, "BUTTON", "Done", BS_OWNERDRAW, GAME_PLOT.right - 100, SETTINGS_BOTTOM_Y, 100, 24, ID_DONE);
+        add_control(hwnd, "BUTTON", "Done", BS_OWNERDRAW, SETTINGS_WIDTH - 110, SETTINGS_BOTTOM_Y, 100, 24, ID_DONE);
         refresh_settings(hwnd);
         return 0;
     case WM_PAINT: {
@@ -1164,7 +1344,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         }
         return 0;
     case WM_DESTROY:
-        // Closing the settings window ends editing: real input goes back to Dolphin.
+        // Closing the settings window ends editing: real input goes back to the game.
         g_calibration_request = -1;
         g_editing = false;
         g_settings_window = nullptr;
@@ -1234,7 +1414,7 @@ static void refresh_offsets(HWND hwnd) {
         uint8_t stick[2] = {static_cast<uint8_t>(128 + calibration.notch[i][0]), static_cast<uint8_t>(128 + calibration.notch[i][1])};
         process_stick(stick, calibration, settings);
         int in_game[2];
-        vc_in_game(stick[0] - 128, stick[1] - 128, in_game);
+        game_in_game(settings.game, stick[0], stick[1], in_game);
         char buffer[32];
         std::snprintf(buffer, sizeof(buffer), "Game %3d,%3d", in_game[0], in_game[1]);
         set_text(hwnd, ID_OFFSET_GAME + i, buffer);
@@ -1377,7 +1557,7 @@ static void open_settings(HWND owner) {
     }
     g_editing = true;
     g_settings_window = create_fixed_window(SETTINGS_CLASS, "Software ESS Adapter settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                                            GAME_PLOT.right + 10, SETTINGS_BOTTOM_Y + 34, owner);
+                                            SETTINGS_WIDTH, SETTINGS_BOTTOM_Y + 34, owner);
     ShowWindow(g_settings_window, SW_SHOW);
 }
 

@@ -45,11 +45,11 @@ Click Edit settings to open the settings window. While it's open, the game gets 
 ![Settings window](docs/images/settings-window.png)
 
 - **ESS:** one checkbox per port. Leave it checked for OoT on VC. Unchecked sends your stick to the game unchanged.
-- **ESS range:** where ESS starts and ends, in in-game values. The default, 9 to 26, feels like a normal ESS adapter. Lower the start or raise the end for a wider ESS range. Default puts both back.
+- **ESS range:** where ESS starts and ends, in in-game values. The default, 9 to 26, feels like a normal ESS adapter. Lower the start or raise the end for a wider ESS range, up to 45 like ElectroModder's adapter. Default puts both back.
 - **Software dead zone:** makes a stick that rests slightly off center read exactly 0, 0 in game. You'd only notice the difference in tools like gz. Default is 2, 0 turns it off.
 - **Notch snapping:** see Notch calibration. Off by default.
 
-The two plots show where your stick is, one dot per controller. "Your stick" shows your stick, and the dot turns blue inside the ESS range. "In game" shows what OoT gets. The dot turns blue when the game counts it as ESS, and the orange outline is where Link runs at full speed.
+The two plots show where your stick is, one dot per controller, colored by what Link does there: dead zone, ESS (green, turning in place), walk, run, and full speed. "Your stick" is your actual stick, with your settings and calibration applied, so you can see exactly where to hold it for ESS. "In game" is what OoT gets. Run and full speed are where they are on flat ground.
 
 Everything is saved to `Software ESS Adapter settings.ini` next to the program.
 
@@ -58,7 +58,7 @@ Everything is saved to `Software ESS Adapter settings.ini` next to the program.
 Notch calibration makes your notches read exactly like a perfect controller's notches in game.
 
 1. In the settings window, click Calibrate on your controller's port.
-2. Follow the line at the bottom of the window. For a notch, hold the stick in that notch and press A. For Neutral, let go of the stick and press A. A green ring shows where the stick should go. B cancels.
+2. Follow the line at the bottom of the window. For a notch, hold the stick in that notch and press A. For Neutral, let go of the stick and press A. A pink ring shows where the stick should go. B cancels.
 3. If you press A outside the notch it asks for, it asks again.
 4. After 16 steps the port shows Notch offsets and Clear. Clear removes the calibration and its notch offsets.
 

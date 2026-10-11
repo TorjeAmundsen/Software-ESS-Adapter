@@ -237,7 +237,7 @@ void DsuServer::handle_packet(const uint8_t* data, int size, const sockaddr_in& 
     }
 }
 
-void DsuServer::publish(const AdapterFrame& frame) {
+void DsuServer::publish(const AdapterFrame& frame, Game game) {
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(mutex_);
     frame_ = frame;
@@ -274,10 +274,13 @@ void DsuServer::publish(const AdapterFrame& frame) {
         msg.packet_counter = packet_counter_[pad]++;
         msg.buttons1 = static_cast<uint8_t>(l << 1 | r << 2 | start << 3 | up << 4 | right << 5 | down << 6 | left << 7);
         msg.buttons2 = static_cast<uint8_t>(z << 3 | y << 4 | b << 5 | a << 6 | x << 7);
-        msg.left_x = to_dolphin_stick(gc.stick[0]);
-        msg.left_y = to_dolphin_stick(gc.stick[1]);
-        msg.right_x = to_dolphin_stick(gc.cstick[0]);
-        msg.right_y = to_dolphin_stick(gc.cstick[1]);
+        auto stick_byte = [game](uint8_t value) {
+            return game == Game::WiiVC ? to_dolphin_stick(value) : value;
+        };
+        msg.left_x = stick_byte(gc.stick[0]);
+        msg.left_y = stick_byte(gc.stick[1]);
+        msg.right_x = stick_byte(gc.cstick[0]);
+        msg.right_y = stick_byte(gc.cstick[1]);
         msg.dpad_left = analog(left);
         msg.dpad_down = analog(down);
         msg.dpad_right = analog(right);

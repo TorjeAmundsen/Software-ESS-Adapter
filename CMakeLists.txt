@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The version (semver), optionally with a prerelease suffix like -alpha or -beta.1. Release tags are
 # "v" plus this, e.g. v0.1.0-alpha. project() only takes the numeric part.
-set(APP_VERSION "0.2.0-alpha")
+set(APP_VERSION "0.3.0-alpha")
 string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" APP_VERSION_NUMBER "${APP_VERSION}")
 project(SoftwareESSAdapter VERSION ${APP_VERSION_NUMBER} LANGUAGES C CXX)
 
@@ -45,11 +45,13 @@ else()
 endif()
 
 add_library(bridge_core STATIC
+  src/delayed_sender.cpp
   src/dsu_server.cpp
   src/ess.cpp
   src/ess_range.cpp
   src/gc_adapter.cpp
   src/notch.cpp
+  src/soh.cpp
   src/stick.cpp)
 target_include_directories(bridge_core PUBLIC src)
 target_compile_definitions(bridge_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -59,6 +61,12 @@ add_executable(software-ess-adapter WIN32 src/main.cpp assets/resources.rc)
 set_target_properties(software-ess-adapter PROPERTIES OUTPUT_NAME "Software ESS Adapter")
 target_link_libraries(software-ess-adapter PRIVATE bridge_core dwmapi shell32)
 target_compile_definitions(software-ess-adapter PRIVATE APP_VERSION="${APP_VERSION}")
+# Ship of Harkinian output and input lag, off until SoH's DSU input is in an official libultraship
+# release. build.ps1 --dev turns it on.
+option(SOH_DEV "Build the Ship of Harkinian features" OFF)
+if(SOH_DEV)
+  target_compile_definitions(software-ess-adapter PRIVATE SOH_DEV)
+endif()
 
 add_executable(bridge-tests test/bridge_tests.cpp)
 target_link_libraries(bridge-tests PRIVATE bridge_core)
