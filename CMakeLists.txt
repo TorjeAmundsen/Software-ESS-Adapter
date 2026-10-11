@@ -45,11 +45,13 @@ else()
 endif()
 
 add_library(bridge_core STATIC
+  src/delayed_sender.cpp
   src/dsu_server.cpp
   src/ess.cpp
   src/ess_range.cpp
   src/gc_adapter.cpp
   src/notch.cpp
+  src/soh.cpp
   src/stick.cpp)
 target_include_directories(bridge_core PUBLIC src)
 target_compile_definitions(bridge_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)

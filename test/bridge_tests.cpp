@@ -4,7 +4,9 @@
 
 // 1. Checks that every stick byte we send reaches Dolphin's emulated GC pad as intended
 //    (DSU client math from DualShockUDPClient.cpp, MapFloat from ControllerEmu.h and GCPadEmu.cpp).
-// 2. Talks to DsuServer like Dolphin does and checks the pad data that comes back.
+// 2. Checks the stick path for Wii VC and Ship of Harkinian: ESS range, dead zone, and the speedrun
+//    rule that each axis's in-game value follows its input.
+// 3. Talks to DsuServer like Dolphin does and checks the pad data that comes back.
 
 #include <winsock2.h>
 
@@ -13,16 +15,22 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
+#include <vector>
 #include <string>
 #include <utility>
 
+#include "delayed_sender.hpp"
 #include "dsu_server.hpp"
 #include "ess.hpp"
 #include "ess_range.hpp"
 #include "notch.hpp"
+#include "soh.hpp"
 #include "stick.hpp"
 
 static int failures = 0;
+static constexpr Game VC = Game::WiiVC;
+static constexpr Game SOH = Game::SoH;
 #define CHECK(cond)                                             \
     do {                                                        \
         if (!(cond)) {                                          \
@@ -227,17 +235,27 @@ static void test_notch_offsets() {
     CHECK(game[0] == 56 && game[1] == -60);
 }
 
+// The default stick settings for a game: its stock ESS range, which changes nothing.
+static StickSettings stock_settings(Game game) {
+    StickSettings settings;
+    settings.game = game;
+    settings.range_start = stock_ess_start(game);
+    settings.range_end = stock_ess_end(game);
+    return settings;
+}
+
 // Physical cardinal distance -> in-game value, through the whole pipeline, all 4 directions.
-static int in_game(int distance, int start, int end, int direction) {
+static int in_game(Game game, int distance, int start, int end, int direction) {
     const int dx[4] = {1, 0, -1, 0}, dy[4] = {0, 1, 0, -1};
     uint8_t s[2] = {static_cast<uint8_t>(128 + dx[direction] * distance), static_cast<uint8_t>(128 + dy[direction] * distance)};
-    StickSettings settings;
+    StickSettings settings = stock_settings(game);
     settings.range_start = start;
     settings.range_end = end;
     process_stick(s, NotchCalibration{}, settings);
-    // VC treats x and y the same way, so read whichever axis is in use.
+    int game_pair[2];
+    game_in_game(game, s[0], s[1], game_pair);
     const int axis = dx[direction] != 0 ? 0 : 1;
-    return std::abs(vc_in_game(s[axis] - 128));
+    return std::abs(game_pair[axis]);
 }
 
 static void test_vc_and_conversion() {
@@ -255,17 +273,19 @@ static void test_vc_and_conversion() {
 
     // The default range, in-game 9 to 26 (8 is unreachable through VC), is the stock map's 11 to 34,
     // so the defaults change nothing.
-    CHECK(physical_start(ESS_IN_GAME_START) == ESS_DEFAULT_START);
-    CHECK(physical_end(ESS_IN_GAME_END) == ESS_DEFAULT_END);
-    CHECK(physical_start(9) == physical_start(8));  // 8 is unreachable, so 8 and 9 start together
+    CHECK(default_ess_start(VC) == 9);
+    CHECK(stock_ess_start(VC) == ESS_DEFAULT_START && stock_ess_end(VC) == ESS_DEFAULT_END);
+    CHECK(physical_start(VC, default_ess_start(VC)) == ESS_DEFAULT_START);
+    CHECK(physical_end(VC, ESS_IN_GAME_END) == ESS_DEFAULT_END);
+    CHECK(physical_start(VC, 9) == physical_start(VC, 8));  // 8 is unreachable, so 8 and 9 start together
 
     // Software dead zone: nothing that would read 2 or less gets through, 3 and up is untouched.
-    const int dead_zone = physical_dead_zone(2);
-    CHECK(physical_dead_zone(0) == 0);
+    const int dead_zone = physical_dead_zone(VC, 2);
+    CHECK(physical_dead_zone(VC, 0) == 0);
     for (int d = 0; d <= 40; ++d) {
         uint8_t s[2] = {static_cast<uint8_t>(128 + d), 128};
         apply_dead_zone(s, dead_zone);
-        if (stock_in_game(d) <= 2) {
+        if (stock_in_game(VC, d) <= 2) {
             CHECK(s[0] == 128);
         } else {
             CHECK(s[0] == 128 + d);
@@ -290,6 +310,12 @@ static void test_vc_and_conversion() {
     CHECK(oot_zone(27, 0) == OotZone::Walk);
     CHECK(oot_zone(21, 21) == OotZone::Ess);   // 14, 14 after the dead zone: 19.8
     CHECK(oot_zone(22, 22) == OotZone::Walk);  // 15, 15: 21.2
+    CHECK(oot_zone(50, 0) == OotZone::Walk);   // 43
+    CHECK(oot_zone(51, 0) == OotZone::Run);    // 44: past 43.75
+    CHECK(oot_zone(65, 0) == OotZone::Run);    // 58
+    CHECK(oot_zone(66, 0) == OotZone::FullSpeed);  // 59: past about 58.6
+    CHECK(oot_zone(80, -80) == OotZone::FullSpeed);
+    CHECK(oot_magnitude(80, 80) == 60.0f);
 
     // Two-axis VC matches the one-axis version on the axes, and is symmetric.
     int both[2];
@@ -301,21 +327,122 @@ static void test_vc_and_conversion() {
     CHECK(both[0] == -mirrored[0] && both[1] == -mirrored[1]);
 }
 
+static void test_soh() {
+    // SoH reads a DSU byte as (byte - 128) / 127 of 85 on each side, clamped, and truncates.
+    auto soh = [](int x, int y) {
+        int game[2];
+        soh_in_game(static_cast<uint8_t>(x), static_cast<uint8_t>(y), game);
+        return std::make_pair(game[0], game[1]);
+    };
+    CHECK(soh(128, 128) == std::make_pair(0, 0));
+    CHECK(soh(255, 128) == std::make_pair(85, 0));
+    CHECK(soh(0, 128) == std::make_pair(-85, 0));
+    CHECK(soh(1, 128) == std::make_pair(-85, 0));
+    CHECK(soh(128, 255) == std::make_pair(0, 85));
+    CHECK(soh(128 + 63, 128) == std::make_pair(42, 0));  // 63 * 85 / 127 = 42.2
+    bool symmetric = true;
+    for (int b = 1; b < 256; ++b) {
+        symmetric = symmetric && soh(b, 128).first == -soh(256 - b, 128).first && soh(128, b).second == soh(b, 128).first;
+    }
+    CHECK(symmetric);
+
+    // Every cardinal value up to 84 can be sent safely away from a truncation edge. 85 and the
+    // octagon corner 69, 69 only come out exactly on one, and the N64's corner, 70, 70, is outside
+    // SoH's octagon.
+    for (int v = 0; v <= 84; ++v) {
+        bool found = false;
+        for (int b = 128; b < 256 && !found; ++b) {
+            int game[2];
+            double margin;
+            soh_in_game(static_cast<uint8_t>(b), 128, game, &margin);
+            found = game[0] == v && game[1] == 0 && margin > 0.001;
+        }
+        if (!found) {
+            std::printf("SoH can't safely reach %d\n", v);
+        }
+        CHECK(found);
+    }
+    double best_corner_margin = -1;
+    bool n64_corner = false;
+    for (int x = 128; x < 256; ++x) {
+        for (int y = 128; y < 256; ++y) {
+            int game[2];
+            double margin;
+            soh_in_game(static_cast<uint8_t>(x), static_cast<uint8_t>(y), game, &margin);
+            if (game[0] == 69 && game[1] == 69) {
+                best_corner_margin = std::max(best_corner_margin, margin);
+            }
+            n64_corner = n64_corner || (game[0] == 70 && game[1] == 70);
+        }
+    }
+    CHECK(best_corner_margin >= 0 && best_corner_margin < 1e-6);
+    CHECK(!n64_corner);
+
+    // The map's N64 stage: full tilt straight is 80, the Gamecube corner is the N64 corner 70, 70.
+    auto n64 = [](int x, int y) {
+        const uint8_t s[2] = {static_cast<uint8_t>(128 + x), static_cast<uint8_t>(128 + y)};
+        int game[2];
+        n64_in_game(s, game);
+        return std::make_pair(game[0], game[1]);
+    };
+    CHECK(n64(0, 0) == std::make_pair(0, 0));
+    CHECK(n64(105, 0) == std::make_pair(80, 0));
+    CHECK(n64(0, -105) == std::make_pair(0, -80));
+    CHECK(n64(75, 75) == std::make_pair(70, 70));
+    CHECK(n64(-75, 75) == std::make_pair(-70, 70));
+    CHECK(n64(-40, 20) == std::make_pair(-n64(40, -20).first, -n64(40, -20).second));
+
+    // On SoH, 8 can be reached, so the default range starts there and changes nothing.
+    CHECK(default_ess_start(SOH) == OOT_ESS_START);
+    CHECK(physical_start(SOH, OOT_ESS_START) == stock_ess_start(SOH));
+    CHECK(physical_end(SOH, ESS_IN_GAME_END) == stock_ess_end(SOH));
+    CHECK(physical_start(SOH, 9) > physical_start(SOH, 8));
+
+    // Through the whole path with defaults, SoH reads what the map aims for: full tilt straight is
+    // 80, and the Gamecube corner reads 68, 68 in every quadrant, just inside SoH's octagon.
+    auto through = [](int x, int y) {
+        uint8_t s[2] = {static_cast<uint8_t>(128 + x), static_cast<uint8_t>(128 + y)};
+        process_stick(s, NotchCalibration{}, stock_settings(SOH));
+        int game[2];
+        soh_in_game(s[0], s[1], game);
+        return std::make_pair(game[0], game[1]);
+    };
+    CHECK(through(0, 0) == std::make_pair(0, 0));
+    CHECK(through(105, 0) == std::make_pair(80, 0));
+    CHECK(through(-105, 0) == std::make_pair(-80, 0));
+    CHECK(through(0, 105) == std::make_pair(0, 80));
+    CHECK(through(75, 75) == std::make_pair(68, 68));
+    CHECK(through(-75, 75) == std::make_pair(-68, 68));
+    CHECK(through(-75, -75) == std::make_pair(-68, -68));
+    CHECK(through(75, -75) == std::make_pair(68, -68));
+    bool aims = true;  // on the axes, every distance reads exactly the map's value
+    for (int d = 0; d <= 105; ++d) {
+        aims = aims && through(d, 0) == n64(d, 0) && through(0, -d) == n64(0, -d);
+    }
+    CHECK(aims);
+}
+
 // In-game value of the stock map (no ESS range remap) at a physical distance on a cardinal,
-// worked out directly from the ESS map and VC, independent of physical_start/physical_end.
-static int stock_reference(int distance) {
+// worked out directly from the ESS map and the game, independent of physical_start/physical_end.
+static int stock_reference(Game game, int distance) {
     uint8_t s[2] = {static_cast<uint8_t>(128 + distance), 128};
+    int game_pair[2];
+    if (game == Game::SoH) {
+        n64_in_game(s, game_pair);
+        return std::abs(game_pair[0]);
+    }
     invert_vc_gc(s);
     return std::abs(vc_in_game(s[0] - 128));
 }
 
-static void test_ess_range() {
+static void test_ess_range(Game game) {
+    const char* const game_name = game == Game::SoH ? "SoH" : "VC";
     // Defaults change nothing anywhere on the stick.
     bool identity = true;
     for (int x = 0; x < 256; ++x) {
         for (int y = 0; y < 256; ++y) {
             uint8_t s[2] = {static_cast<uint8_t>(x), static_cast<uint8_t>(y)};
-            remap_ess_range(s, ESS_DEFAULT_START, ESS_DEFAULT_END);
+            remap_ess_range(game, s, stock_ess_start(game), stock_ess_end(game));
             identity = identity && s[0] == x && s[1] == y;
         }
     }
@@ -324,11 +451,11 @@ static void test_ess_range() {
     // A range of in-game a to b means: ESS starts where the stock map first reads a or more and
     // ends where it last reads b or less. In-game 0-7 is dead zone, 8-26 is ESS (OoT libu64/pad.c,
     // z_player.c). The expected distances come straight from the stock map.
-    const int ranges[][2] = {{1, 20}, {5, 26}, {8, 26}, {9, 26}, {7, 32}, {8, 35}, {15, 45}, {20, max_in_game_end()}};
+    const int ranges[][2] = {{1, 20}, {5, 26}, {8, 26}, {9, 26}, {7, 32}, {8, 35}, {15, 45}, {20, max_in_game_end(game)}};
     for (const auto& range : ranges) {
         int first = -1, last = -1;
         for (int d = 0; d <= ESS_MAX_END; ++d) {
-            const int stock = stock_reference(d);
+            const int stock = stock_reference(game, d);
             if (first < 0 && stock >= range[0]) {
                 first = d;
             }
@@ -336,14 +463,14 @@ static void test_ess_range() {
                 last = d;
             }
         }
-        const int start = physical_start(range[0]);
-        const int end = physical_end(range[1]);
+        const int start = physical_start(game, range[0]);
+        const int end = physical_end(game, range[1]);
         CHECK(start == first);
         CHECK(end == last);
         for (int direction = 0; direction < 4; ++direction) {
             bool ok = true;
             for (int d = 0; d <= 105; ++d) {
-                const int value = in_game(d, start, end, direction);
+                const int value = in_game(game, d, start, end, direction);
                 if (d < first) {
                     ok = ok && value <= 7;
                 } else if (d <= last) {
@@ -353,7 +480,7 @@ static void test_ess_range() {
                 }
             }
             if (!ok) {
-                std::printf("range %d-%d direction %d\n", range[0], range[1], direction);
+                std::printf("%s range %d-%d direction %d\n", game_name, range[0], range[1], direction);
             }
             CHECK(ok);
         }
@@ -366,42 +493,42 @@ static void test_ess_range() {
     // rounding moves a stick in and out of the dead zone as one axis rises. Keeping each axis from
     // dropping (step 5 of process_stick) then lets a few spots at the edge read up to 7 in game,
     // which is still OoT's own dead zone, so it only checks that ESS is untouched there.
-    auto pipeline = [](int x, int y, int start, int end, int dead_zone, int game[2]) {
+    auto pipeline = [game](int x, int y, int start, int end, int dead_zone, int game_pair[2]) {
         uint8_t s[2] = {static_cast<uint8_t>(128 + x), static_cast<uint8_t>(128 + y)};
-        StickSettings settings;
+        StickSettings settings = stock_settings(game);
         settings.range_start = start;
         settings.range_end = end;
         settings.dead_zone_distance = dead_zone;
         process_stick(s, NotchCalibration{}, settings);
-        vc_in_game(s[0] - 128, s[1] - 128, game);
+        game_in_game(game, s[0], s[1], game_pair);
     };
     for (const int range_start : {3, 9, 15, 20}) {
-        const int start = physical_start(range_start), end = physical_end(26);
-        const int largest = physical_dead_zone(range_start - 1);
+        const int start = physical_start(game, range_start), end = physical_end(game, 26);
+        const int largest = physical_dead_zone(game, range_start - 1);
         bool ok = true;
         for (int x = -60; x <= 60; ++x) {
             for (int y = -60; y <= 60; ++y) {
-                int game[2];
-                pipeline(x, y, start, end, largest, game);
-                const bool game_dead_zone = std::abs(game[0]) <= 7 && std::abs(game[1]) <= 7;
-                ok = ok && (range_start == 3 || !game_dead_zone || (game[0] == 0 && game[1] == 0));
+                int game_pair[2];
+                pipeline(x, y, start, end, largest, game_pair);
+                const bool game_dead_zone = std::abs(game_pair[0]) <= 7 && std::abs(game_pair[1]) <= 7;
+                ok = ok && (range_start == 3 || !game_dead_zone || (game_pair[0] == 0 && game_pair[1] == 0));
             }
         }
         int first_ess[2];
         pipeline(start, 0, start, end, largest, first_ess);  // the range start itself is still ESS
         ok = ok && first_ess[0] >= 8;
         if (!ok) {
-            std::printf("largest dead zone wrong with range start %d\n", range_start);
+            std::printf("%s: largest dead zone wrong with range start %d\n", game_name, range_start);
         }
         CHECK(ok);
     }
     bool resting_ok = true;
     for (int x = -60; x <= 60; ++x) {
         for (int y = -60; y <= 60; ++y) {
-            int game[2];
-            pipeline(x, y, ESS_DEFAULT_START, ESS_DEFAULT_END, physical_dead_zone(2), game);
-            const bool small = std::abs(game[0]) <= 2 && std::abs(game[1]) <= 2;
-            resting_ok = resting_ok && (!small || (game[0] == 0 && game[1] == 0));
+            int game_pair[2];
+            pipeline(x, y, stock_ess_start(game), stock_ess_end(game), physical_dead_zone(game, 2), game_pair);
+            const bool small = std::abs(game_pair[0]) <= 2 && std::abs(game_pair[1]) <= 2;
+            resting_ok = resting_ok && (!small || (game_pair[0] == 0 && game_pair[1] == 0));
         }
     }
     CHECK(resting_ok);
@@ -461,7 +588,7 @@ static void test_dsu_server() {
     frame[1].stick[0] = 200;
     frame[1].stick[1] = 17;
     frame[1].trigger[0] = 99;
-    server.publish(frame);
+    server.publish(frame, VC);
     CHECK(!server.is_transmitting());  // nobody has subscribed yet
 
     // ListPorts for pads 0 and 1: pad 0 disconnected, pad 1 connected.
@@ -492,7 +619,7 @@ static void test_dsu_server() {
     send(client, reinterpret_cast<char*>(req), 28, 0);
     Sleep(100);  // let the server thread register us
     CHECK(server.client_count() == 1);
-    server.publish(frame);
+    server.publish(frame, VC);
     CHECK(server.is_transmitting());
 
     const int n = receive(client, buf, sizeof(buf));
@@ -507,6 +634,12 @@ static void test_dsu_server() {
         CHECK(buf[52] == 255);                   // r1 analog
         CHECK(buf[55] == 99);                    // l2 analog
     }
+    server.publish(frame, SOH);
+    if (receive(client, buf, sizeof(buf)) == 100) {
+        CHECK(buf[40] == 200 && buf[41] == 17);  // SoH reads bytes as they are
+    } else {
+        CHECK(!"no pad data for SoH");
+    }
 
     closesocket(client);
     server.stop();
@@ -520,13 +653,13 @@ static int monotonic_breaks(const char* name, const NotchCalibration& cal, const
     auto game_at = [&](int x, int y, int game[2]) {
         uint8_t s[2] = {static_cast<uint8_t>(x), static_cast<uint8_t>(y)};
         process_stick(s, cal, settings);
-        vc_in_game(s[0] - 128, s[1] - 128, game);
+        game_in_game(settings.game, s[0], s[1], game);
     };
     int breaks = 0;
     auto report = [&](const char* what, int axis, int moved, int held, int value, int previous) {
         if (breaks++ == 0) {
-            std::printf("%s: axis %d at %d (other held at %d) %s %d (before: %d)\n", name, axis, moved - 128, held - 128, what, value,
-                        previous);
+            std::printf("%s, %s: axis %d at %d (other held at %d) %s %d (before: %d)\n", settings.game == Game::SoH ? "SoH" : "VC", name,
+                        axis, moved - 128, held - 128, what, value, previous);
         }
     };
     int center[2];
@@ -565,17 +698,17 @@ static NotchCalibration turned_notches(double degrees, double scale) {
     return cal;
 }
 
-static void test_axes_monotonic() {
-    // Fixed cases: the defaults, ESS range 9 to 40 and 3 to 26, which the ESS map alone breaks,
-    // notches turned 5 degrees, and notch offsets with snapping, ESS on and off. With ESS off,
+static void test_axes_monotonic(Game game) {
+    // Fixed cases: the defaults, ESS range 9 to 40 and 3 to 26, which the ESS map alone breaks on
+    // VC, notches turned 5 degrees, and notch offsets with snapping, ESS on and off. With ESS off,
     // snapping alone breaks it through VC's length limit, and big offsets in hundreds of places.
     const NotchCalibration turned = turned_notches(5, 0.95);
-    StickSettings defaults;
-    defaults.dead_zone_distance = physical_dead_zone(DEAD_ZONE_DEFAULT);
+    StickSettings defaults = stock_settings(game);
+    defaults.dead_zone_distance = physical_dead_zone(game, DEAD_ZONE_DEFAULT);
     StickSettings wide = defaults;
-    wide.range_end = physical_end(40);
+    wide.range_end = physical_end(game, 40);
     StickSettings low_start = defaults;
-    low_start.range_start = physical_start(3);
+    low_start.range_start = physical_start(game, 3);
     // Targets turned 20 degrees, alternately toward each other, at 60% to 115% of the ideal
     // distance: neighbors end up 5 degrees apart.
     NotchCalibration offsets = turned;
@@ -598,11 +731,11 @@ static void test_axes_monotonic() {
         boxed_in.offset[i][0] = static_cast<int8_t>(boxed_in_offsets[i][0]);
         boxed_in.offset[i][1] = static_cast<int8_t>(boxed_in_offsets[i][1]);
     }
-    StickSettings boxed_in_settings;
+    StickSettings boxed_in_settings = stock_settings(game);
     boxed_in_settings.snap_distance = 1;
-    boxed_in_settings.range_start = physical_start(5);
-    boxed_in_settings.range_end = physical_end(35);
-    boxed_in_settings.dead_zone_distance = physical_dead_zone(4);
+    boxed_in_settings.range_start = physical_start(game, 5);
+    boxed_in_settings.range_end = physical_end(game, 35);
+    boxed_in_settings.dead_zone_distance = physical_dead_zone(game, 4);
 
     const struct {
         const char* name;
@@ -622,7 +755,7 @@ static void test_axes_monotonic() {
 
     // Random cases from a fixed seed: calibrations turned, scaled and jittered, targets anywhere in
     // their sections, ESS on and off, any snap distance, ESS range and dead zone.
-    unsigned seed = 12345;
+    unsigned seed = game == Game::SoH ? 54321 : 12345;
     auto random = [&](int low, int high) {
         seed = seed * 1103515245 + 12345;
         return low + static_cast<int>((seed >> 8) % static_cast<unsigned>(high - low + 1));
@@ -649,22 +782,26 @@ static void test_axes_monotonic() {
                 cal.offset[i][1] = static_cast<int8_t>(dy);
             }
         }
-        StickSettings settings;
+        StickSettings settings = stock_settings(game);
         settings.ess = random(0, 3) > 0;
         settings.snap_distance = random(0, MAX_SNAP_DISTANCE);
-        const int start = random(1, 15), end = random(start + 1, std::min(start + 45, max_in_game_end()));
-        settings.range_start = physical_start(start);
-        settings.range_end = std::max(physical_end(end), settings.range_start + 1);
-        settings.dead_zone_distance = physical_dead_zone(random(0, start - 1));
+        const int start = random(1, 15), end = random(start + 1, std::min(start + 45, max_in_game_end(game)));
+        settings.range_start = physical_start(game, start);
+        settings.range_end = std::max(physical_end(game, end), settings.range_start + 1);
+        settings.dead_zone_distance = physical_dead_zone(game, random(0, start - 1));
         const std::string name = "random case " + std::to_string(n);
         CHECK(monotonic_breaks(name.c_str(), cal, settings) == 0);
     }
 
-    // With ESS off and no calibration, the pass changes nothing: only the dead zone applies.
+    // With ESS off and no calibration on VC, the pass changes nothing: only the dead zone applies.
+    // (SoH's octagon can pull an axis back, so there the pass can change things.)
+    if (game == Game::SoH) {
+        return;
+    }
     for (const int dead_zone : {0, 2, 6}) {
         StickSettings plain;
         plain.ess = false;
-        plain.dead_zone_distance = physical_dead_zone(dead_zone);
+        plain.dead_zone_distance = physical_dead_zone(VC, dead_zone);
         bool same = true;
         for (int x = 0; x < 256; ++x) {
             for (int y = 0; y < 256; ++y) {
@@ -678,6 +815,64 @@ static void test_axes_monotonic() {
     }
 }
 
+static void test_delayed_sender() {
+    using namespace std::chrono;
+    struct Sent {
+        steady_clock::time_point at;
+        int id;
+        Game game;
+    };
+    std::mutex mutex;
+    std::vector<Sent> sent;
+    auto frame_with_id = [](int id) {
+        AdapterFrame frame{};
+        frame[0].stick[0] = static_cast<uint8_t>(id);
+        return frame;
+    };
+    {
+        DelayedSender sender([&](const AdapterFrame& frame, Game game) {
+            std::lock_guard lock(mutex);
+            sent.push_back({steady_clock::now(), frame[0].stick[0], game});
+        });
+
+        // No lag: sent right away, on the calling thread.
+        sender.push(frame_with_id(1), VC, microseconds(0));
+        CHECK(sent.size() == 1 && sent[0].id == 1 && sent[0].game == VC);
+
+        // 30 ms: every frame goes out 30 ms after it came in, in order. A few milliseconds late is
+        // fine (the thread has to wake up), early never.
+        std::vector<steady_clock::time_point> pushed;
+        for (int id = 2; id < 12; ++id) {
+            pushed.push_back(steady_clock::now());
+            sender.push(frame_with_id(id), SOH, milliseconds(30));
+            Sleep(4);
+        }
+        Sleep(80);
+        {
+            std::lock_guard lock(mutex);
+            CHECK(sent.size() == 11);
+            long long worst_late_us = 0;
+            bool on_time = sent.size() == 11;
+            for (size_t i = 1; i < sent.size() && on_time; ++i) {
+                const auto late = duration_cast<microseconds>(sent[i].at - (pushed[i - 1] + milliseconds(30))).count();
+                on_time = sent[i].id == static_cast<int>(i) + 1 && sent[i].game == SOH && late >= 0;
+                worst_late_us = std::max(worst_late_us, late);
+            }
+            std::printf("input lag: worst %lld us late\n", worst_late_us);
+            CHECK(on_time);
+            CHECK(worst_late_us < 5000);
+        }
+
+        // Changing the lag drops what is still waiting, so nothing goes out of order: frame 12
+        // waits 50 ms, then frame 13 with no lag goes out at once and 12 never does.
+        sender.push(frame_with_id(12), SOH, milliseconds(50));
+        sender.push(frame_with_id(13), SOH, microseconds(0));
+        Sleep(80);
+        std::lock_guard lock(mutex);
+        CHECK(sent.size() == 12 && sent.back().id == 13);
+    }
+}
+
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -688,9 +883,13 @@ int main() {
     test_notch_warp_and_snap();
     test_notch_offsets();
     test_vc_and_conversion();
-    test_ess_range();
-    test_axes_monotonic();
+    test_soh();
+    for (const Game game : {VC, SOH}) {
+        test_ess_range(game);
+        test_axes_monotonic(game);
+    }
     test_dsu_server();
+    test_delayed_sender();
     WSACleanup();
     std::printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures ? 1 : 0;

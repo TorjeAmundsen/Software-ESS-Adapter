@@ -4,11 +4,19 @@ How the program works, how to build it, and where things are in the source. For 
 
 ## How it works
 
-Dolphin's own adapter support reads the USB device directly, and nothing else can hook into that path. So the program claims the adapter (WUP-028) with libusb, runs each report through origin centering (with the calibrated neutral range), the notch warp, notch snapping, the ESS range, the dead zone, the ESS map and a pass that keeps each axis moving with its input in game, and serves the result to Dolphin as a DSU (cemuhook) controller over UDP on `127.0.0.1:26760`. It forwards every adapter report as it arrives, so its rate matches the adapter's (125 Hz stock, higher when overclocked).
+Dolphin's own adapter support reads the USB device directly, and nothing else can hook into that path. So the program claims the adapter (WUP-028) with libusb, runs each report through origin centering (with the calibrated neutral range), the notch warp, notch snapping, the ESS range, the dead zone, the ESS map and a pass that keeps each axis moving with its input in game, and serves the result to Dolphin (or Ship of Harkinian) as a DSU (cemuhook) controller over UDP on `127.0.0.1:26760`. It forwards every adapter report as it arrives, so its rate matches the adapter's (125 Hz stock, higher when overclocked).
 
 ### Does the ESS output survive Dolphin?
 
 Yes, if the stick has no dead zone and no calibration in Dolphin, with one correction on our side. Dolphin turns a DSU stick byte `v` into `(v-128)/127` above center and `(v-128)/128` below, then maps it back to a byte with `MapFloat(x, 128, 1)` (GCPadEmu.cpp), which scales by 127 on both sides. Above center every byte comes back unchanged. Below center, bytes 0 to 64 come back one too high, so ESS full tilt left (64) would arrive as 65. `to_dolphin_stick` in `dsu_server.cpp` sends one less for 1 to 64, so every byte from 1 to 255 arrives as intended (0 can't be reached and arrives as 1). `bridge-tests` checks all of them with Dolphin's formulas. A dead zone or a calibration other than the default in Dolphin rescales the stick and breaks the ESS map. The profile doesn't need to set them: loading a profile resets any setting it leaves out to its default (`NumericSetting::LoadFromIni`), and an empty calibration and center mean the defaults (`ReshapableInput::LoadConfig`).
+
+### Ship of Harkinian
+
+With "Playing on" set to Ship of Harkinian, there is no VC in between: the game reads the stick from libultraship. So the target is the ESS map's N64 stage (`gc_to_n64`), with each axis capped at 80 the way the VC inversion caps it, and the program sends whichever bytes SoH turns into that. This needs a libultraship with DSU input, which isn't upstream yet, and SoH's stick set to dead zone 0%, sensitivity 100% and notch snap angle 0.
+
+With those settings, libultraship reads a byte `v` as `(v-128)/127` of 85, clamped, and runs `ControllerStick::Process`: an octagon through 85, 0 and 69, 69, a trip through `atan2` and `cos`/`sin` past 90% of the range, and truncation to `int8_t`. `soh_in_game` in `soh.cpp` copies that math float for float. For each in-game pair, the table sends the byte pair furthest from a truncation edge and leaves out pairs within 1e-6 of one, so a build that rounds a last digit differently still reads the same. The octagon's corner, 69, 69, only comes out exactly on a truncation edge, so targets stay strictly inside the octagon, and a calibrated diagonal reads 68, 68 (70, 70 on N64). SoH reads bytes as they are, so `to_dolphin_stick` is skipped. SoH can produce 8, so there the default ESS range is 8 to 26.
+
+SoH answers the stick much sooner than Dolphin running Wii VC, so "Input lag" (SoH only, 0 to 100 ms, as in pyESS) delays everything that goes out, buttons and disconnects included. `DelayedSender` sends each frame exactly that long after it came in, from its own thread on a high-resolution waitable timer, so the lag isn't rounded to the adapter's report rate (the tests measure it under half a millisecond late). Changing the lag drops frames still waiting, so nothing goes out of order. The main window shows the lag next to the connection status.
 
 ### Centering
 
@@ -16,7 +24,7 @@ Without calibrated notches, the first report after a controller is plugged in is
 
 ### ESS range and software dead zone
 
-OoT turns Link in place without walking when the in-game stick value is 8 to 26 on a cardinal. 0 to 7 is the game's dead zone, and walking starts at magnitude 20 (27 on a cardinal), per `PadUtils_UpdateRelXY` and `Player_CalcSpeedAndYawFromControlStick` in the OoT decomp. VC never produces 8, 13, 17, 22 or 25, so 9 is the first reachable ESS value.
+OoT turns Link in place without walking when the in-game stick value is 8 to 26 on a cardinal. 0 to 7 is the game's dead zone, and walking starts at magnitude 20 (27 on a cardinal), per `PadUtils_UpdateRelXY` and `Player_CalcSpeedAndYawFromControlStick` in the OoT decomp. VC never produces 8, 13, 17, 22 or 25, so on VC 9 is the first reachable ESS value.
 
 The ESS range settings are "feel" values. Start S and end E are turned into the physical distances where the stock map reads S and E in game, and the stick is remapped radially so those distances land on the stock 9 and 26. Below the start goes into the game dead zone, past the end is spread out to full tilt, and full tilt doesn't move. A skipped value behaves like the next reachable value as a start and the previous one as an end. The range is exact on cardinals only, because the game applies its dead zone per axis.
 
@@ -36,7 +44,7 @@ Moving a notch target moves both axes, and so does snapping. VC then shortens lo
 
 ### DSU buttons
 
-DSU copies a PlayStation controller, so Gamecube buttons go out under PlayStation names (A is Cross, Z is R1, and so on). `dolphin/Software ESS Adapter.ini` has the full mapping. To map the main stick by hand in Dolphin, ESS has to be off for that port: ESS output never goes past half deflection, because VC already treats that as full tilt, and Dolphin only registers a stick direction for mapping past 55%.
+DSU copies a PlayStation controller, so Gamecube buttons go out under PlayStation names (A is Cross, Z is R1, and so on). `dolphin/Software ESS Adapter.ini` has the full mapping. To map the main stick by hand in Dolphin, ESS has to be off for that port: ESS output never goes past half deflection, because VC already treats that as full tilt, and Dolphin only registers a stick direction for mapping past 55%. SoH's input editor needs 70%, which the Ship of Harkinian output reaches.
 
 ## Build
 
@@ -89,10 +97,12 @@ The style is in `.clang-format`: 4-space indents, 140-column lines, and braces o
 - `src/ess.cpp` holds the Gamecube functions from `ESS-Adapter/ESS.cpp` in [Skuzee/ESS-Adapter](https://github.com/Skuzee/ESS-Adapter), copied unchanged, with a few defines at the top in place of the Arduino-specific memory macros. If the map changes there, copy the functions here too.
 - `src/gc_adapter.cpp` reads the adapter with libusb, using the same protocol as Dolphin's `GCAdapter.cpp`.
 - `src/dsu_server.cpp` is the UDP server, with packet layouts from Dolphin's `DualShockUDPProto.h`.
+- `src/delayed_sender.cpp` adds the optional input lag on SoH.
+- `src/soh.cpp` has the ESS map's N64 stage for Ship of Harkinian and a copy of SoH's stick math.
 - `src/ess_range.cpp` has the ESS range remap, the software dead zone, the Wii VC stick mapping (ported from `generate-map.py` in ESS-Adapter), and OoT's dead zone and ESS rules (`PadUtils_UpdateRelXY` and `Player_CalcSpeedAndYawFromControlStick` in the OoT decomp).
-- `src/stick.cpp` has `process_stick`: the main stick's path from the centered stick to what goes to Dolphin (notch warp, snapping, ESS range, software dead zone, ESS map, then, ESS on or off, a pass that keeps each axis's in-game value, after Wii VC, from ever moving the opposite way to its own input, as the speedrun rules require). That pass is worked out for every stick position at once, into a table per settings and calibration, which takes a few milliseconds the first time each combination is used (around 50 at most). Near VC's length limit a position can be boxed in: x has to reach as far out as one neighbor and y as far out as another, and VC can't do both. Then the positions further in on the axis that fell short get bounded and the table is worked out again, until nothing is boxed in. The tests sweep every raw stick position for fixed and 150 random settings and calibrations. The bridge loop and the tests both call it.
+- `src/stick.cpp` has `process_stick`: the main stick's path from the centered stick to what goes to the game (notch warp, snapping, ESS range, software dead zone, ESS map, then, ESS on or off, a pass that keeps each axis's in-game value, after Wii VC or SoH, from ever moving the opposite way to its own input, as the speedrun rules require). That pass is worked out for every stick position at once, into a table per settings and calibration, which takes a few milliseconds the first time each combination is used (around 50 at most). Near VC's length limit a position can be boxed in: x has to reach as far out as one neighbor and y as far out as another, and VC can't do both. Then the positions further in on the axis that fell short get bounded and the table is worked out again, until nothing is boxed in. The tests sweep every raw stick position for fixed and 150 random settings and calibrations, for each game. The bridge loop and the tests both call it.
 - `src/notch.cpp` has notch calibration, the notch warp, and snapping. The warp splits the stick into 8 slices between neighboring notches and the center, and maps each slice linearly so its two calibrated notches land on their targets (the ideal notches plus any notch offsets).
-- `src/main.cpp` has the windows, calibration, the settings file, and the bridge loop: read the adapter, center each stick, `process_stick`, send to Dolphin.
+- `src/main.cpp` has the windows, calibration, the settings file, and the bridge loop: read the adapter, center each stick, `process_stick`, send to the game.
 - `src/resource.h` has the resource ids shared by `assets/resources.rc` and the code.
 - `test/bridge_tests.cpp` has the tests.
 - `assets/icon.svg` is the app icon: a GameCube control stick in its octagonal gate. `assets/icon.ico` is made from it and committed, so building doesn't need any image tools. `assets/resources.rc` puts it in the exe. After changing the SVG, regenerate the `.ico` with ImageMagick:

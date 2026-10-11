@@ -10,6 +10,7 @@
 
 #include "ess.hpp"
 #include "notch.hpp"
+#include "soh.hpp"
 
 static constexpr double FULL_TILT = GATE_STRAIGHT;  // the Gamecube straight range gc_to_n64 assumes
 
@@ -32,16 +33,42 @@ void vc_in_game(int gc_x, int gc_y, int in_game[2]) {
     }
 }
 
-OotZone oot_zone(int x, int y) {
+float oot_magnitude(int x, int y) {
     auto rel = [](int c) {
         const int dz = OOT_DEAD_ZONE, top = OOT_DEAD_ZONE + OOT_REL_MAX;
         return c > dz ? std::min(c, top) - dz : c < -dz ? std::max(c, -top) + dz : 0;
     };
-    const int rx = rel(x), ry = rel(y);
-    if (rx == 0 && ry == 0) {
+    const float rx = static_cast<float>(rel(x)), ry = static_cast<float>(rel(y));
+    return std::min(std::sqrt(rx * rx + ry * ry), 60.0f);
+}
+
+// Running speed at a magnitude on flat ground, as Player_CalcSpeedAndYawFromControlStick works it
+// out, before the speed cap. Math_CosS reads a table in steps of 16 angle units, so this rounds
+// the angle down the same way.
+static double oot_running_speed(float magnitude) {
+    const float over = magnitude - 20.0f;
+    if (over < 0) {
+        return 0;
+    }
+    const int angle = static_cast<int16_t>(over * 450.0f) & ~15;
+    const double cosine = std::cos(angle * 3.14159265358979323846 / 32768);
+    const double temp = 1.0 - cosine;
+    return (temp * temp * 30.0 + 7.0) * 0.14;
+}
+
+OotZone oot_zone(int x, int y) {
+    const float magnitude = oot_magnitude(x, y);
+    if (magnitude == 0) {
         return OotZone::DeadZone;
     }
-    return std::sqrt(static_cast<double>(rx * rx + ry * ry)) < OOT_WALK_MAGNITUDE ? OotZone::Ess : OotZone::Walk;
+    if (magnitude < OOT_WALK_MAGNITUDE) {
+        return OotZone::Ess;
+    }
+    if (magnitude * 0.8f * 0.14f <= 4.9f) {
+        return OotZone::Walk;
+    }
+    constexpr double SPEED_CAP = 600 / 100.0;  // R_RUN_SPEED_LIMIT, normal boots
+    return oot_running_speed(magnitude) < SPEED_CAP ? OotZone::Run : OotZone::FullSpeed;
 }
 
 int vc_in_game(int gc_offset) {
@@ -50,41 +77,68 @@ int vc_in_game(int gc_offset) {
     return in_game[0];
 }
 
-int stock_in_game(int distance) {
+void game_in_game(Game game, uint8_t x, uint8_t y, int in_game[2]) {
+    if (game == Game::SoH) {
+        soh_in_game(x, y, in_game);
+    } else {
+        vc_in_game(x - 128, y - 128, in_game);
+    }
+}
+
+int stock_in_game(Game game, int distance) {
     uint8_t stick[2] = {static_cast<uint8_t>(128 + distance), 128};
+    if (game == Game::SoH) {
+        int in_game[2];
+        n64_in_game(stick, in_game);
+        return in_game[0];
+    }
     invert_vc_gc(stick);
     return vc_in_game(stick[0] - 128);
 }
 
-int physical_start(int in_game) {
+int physical_start(Game game, int in_game) {
     for (int d = 0; d < ESS_MAX_END; ++d) {
-        if (stock_in_game(d) >= in_game) {
+        if (stock_in_game(game, d) >= in_game) {
             return d;
         }
     }
     return ESS_MAX_END;
 }
 
-int physical_end(int in_game) {
+int physical_end(Game game, int in_game) {
     int last = 0;
     for (int d = 0; d <= ESS_MAX_END; ++d) {
-        if (stock_in_game(d) <= in_game) {
+        if (stock_in_game(game, d) <= in_game) {
             last = d;
         }
     }
     return last;
 }
 
-int max_in_game_end() {
-    return stock_in_game(ESS_MAX_END);
+int default_ess_start(Game game) {
+    return stock_in_game(game, physical_start(game, OOT_ESS_START));
 }
 
-int physical_dead_zone(int in_game) {
-    return in_game > 0 ? physical_start(in_game + 1) : 0;
+int stock_ess_start(Game game) {
+    static const int start[2] = {physical_start(Game::WiiVC, OOT_ESS_START), physical_start(Game::SoH, OOT_ESS_START)};
+    return start[game == Game::SoH];
 }
 
-double dead_zone_after_range(int distance, int start) {
-    return static_cast<double>(distance) * ESS_DEFAULT_START / start;
+int stock_ess_end(Game game) {
+    static const int end[2] = {physical_end(Game::WiiVC, ESS_IN_GAME_END), physical_end(Game::SoH, ESS_IN_GAME_END)};
+    return end[game == Game::SoH];
+}
+
+int max_in_game_end(Game game) {
+    return stock_in_game(game, ESS_MAX_END);
+}
+
+int physical_dead_zone(Game game, int in_game) {
+    return in_game > 0 ? physical_start(game, in_game + 1) : 0;
+}
+
+double dead_zone_after_range(Game game, int distance, int start) {
+    return static_cast<double>(distance) * stock_ess_start(game) / start;
 }
 
 void apply_dead_zone(uint8_t stick[2], double distance) {
@@ -95,7 +149,7 @@ void apply_dead_zone(uint8_t stick[2], double distance) {
     }
 }
 
-void remap_ess_range(uint8_t stick[2], int start, int end) {
+void remap_ess_range(Game game, uint8_t stick[2], int start, int end) {
     const double x = stick[0] - 128;
     const double y = stick[1] - 128;
     const double r = std::sqrt(x * x + y * y);
@@ -104,7 +158,7 @@ void remap_ess_range(uint8_t stick[2], int start, int end) {
     }
 
     // Piecewise linear: [0, start] -> [0, S], [start, end] -> [S, E], [end, 105] -> [E, 105].
-    const double S = ESS_DEFAULT_START, E = ESS_DEFAULT_END;
+    const double S = stock_ess_start(game), E = stock_ess_end(game);
     double mapped;
     if (r < start) {
         // Stay just under the value that rounds up to S, so nothing below start enters the range.
