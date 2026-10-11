@@ -12,6 +12,8 @@ Yes, if the stick has no dead zone and no calibration in Dolphin, with one corre
 
 ### Ship of Harkinian
 
+Dev builds only (`.\build.ps1 --dev`, the CMake option `SOH_DEV`) until SoH's DSU input is in an official libultraship release. Other builds have no "Playing on" or input lag rows, always play on Wii VC, and ignore those settings in the settings file. The SoH code and its tests are in `bridge_core` and build and run either way.
+
 With "Playing on" set to Ship of Harkinian, there is no VC in between: the game reads the stick from libultraship. So the target is the ESS map's N64 stage (`gc_to_n64`), with each axis capped at 80 the way the VC inversion caps it, and the program sends whichever bytes SoH turns into that. This needs a libultraship with DSU input, which isn't upstream yet, and SoH's stick set to dead zone 0%, sensitivity 100% and notch snap angle 0.
 
 With those settings, libultraship reads a byte `v` as `(v-128)/127` of 85, clamped, and runs `ControllerStick::Process`: an octagon through 85, 0 and 69, 69, a trip through `atan2` and `cos`/`sin` past 90% of the range, and truncation to `int8_t`. `soh_in_game` in `soh.cpp` copies that math float for float. For each in-game pair, the table sends the byte pair furthest from a truncation edge and leaves out pairs within 1e-6 of one, so a build that rounds a last digit differently still reads the same. The octagon's corner, 69, 69, only comes out exactly on a truncation edge, so targets stay strictly inside the octagon, and a calibrated diagonal reads 68, 68 (70, 70 on N64). SoH reads bytes as they are, so `to_dolphin_stick` is skipped. SoH can produce 8, so there the default ESS range is 8 to 26.
@@ -59,7 +61,7 @@ You need CMake 3.20+, Ninja, and a C++17 compiler. Either works:
 .\build.ps1
 ```
 
-This builds the program in `build/msvc` or `build/mingw`, depending on the compiler (a separate folder each, so switching compilers just works), and writes `dist/software-ess-adapter.zip` with the exe and the Dolphin profile. `.\build.ps1 --output <name>` writes `dist/<name>.zip` instead. The exe has the C++ runtime built in, so it only needs DLLs that come with Windows.
+This builds the program in `build/msvc` or `build/mingw`, depending on the compiler (a separate folder each, so switching compilers just works), and writes `dist/software-ess-adapter.zip` with the exe and the Dolphin profile. `.\build.ps1 --output <name>` writes `dist/<name>.zip` instead, and `--dev` adds the Ship of Harkinian features (see above). The exe has the C++ runtime built in, so it only needs DLLs that come with Windows.
 
 To run the tests:
 

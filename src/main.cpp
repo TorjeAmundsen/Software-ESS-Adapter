@@ -39,6 +39,14 @@ static constexpr DWORD DWM_USE_IMMERSIVE_DARK_MODE = 20;  // DWMWA_USE_IMMERSIVE
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
+// Ship of Harkinian output and input lag are only in dev builds (.uild.ps1 --dev) until SoH's DSU
+// input is in an official libultraship release. Without them the program always plays on Wii VC.
+#ifdef SOH_DEV
+static constexpr bool SOH_FEATURES = true;
+#else
+static constexpr bool SOH_FEATURES = false;
+#endif
+
 enum ControlId {
     ID_ADAPTER_STATUS = 100,
     ID_DSU_STATUS,
@@ -135,8 +143,9 @@ static constexpr int GAME_PLOT_RANGE = 90;                   // in-game units fr
 static constexpr int N64_STRAIGHT = 80, N64_DIAGONAL = 70;   // the N64 stick range, drawn on the game plot
 static constexpr int LEGEND_WIDTH = 150;                     // beside the game plot: a row per zone
 static constexpr int STICK_PLOT_SIZE = 2 * PLOT_SCALE * STICK_PLOT_RANGE, GAME_PLOT_SIZE = 2 * PLOT_SCALE * GAME_PLOT_RANGE;
-static const RECT STICK_PLOT = {10, 312, 10 + STICK_PLOT_SIZE, 312 + STICK_PLOT_SIZE};
-static const RECT GAME_PLOT = {STICK_PLOT.right + 10, 312, STICK_PLOT.right + 10 + GAME_PLOT_SIZE, 312 + GAME_PLOT_SIZE};
+static constexpr int PLOTS_TOP = SOH_FEATURES ? 312 : 252;  // under the settings rows (two more in dev builds)
+static const RECT STICK_PLOT = {10, PLOTS_TOP, 10 + STICK_PLOT_SIZE, PLOTS_TOP + STICK_PLOT_SIZE};
+static const RECT GAME_PLOT = {STICK_PLOT.right + 10, PLOTS_TOP, STICK_PLOT.right + 10 + GAME_PLOT_SIZE, PLOTS_TOP + GAME_PLOT_SIZE};
 static const int SETTINGS_BOTTOM_Y = STICK_PLOT.bottom + 12;  // the prompt line and Done
 static const int SETTINGS_WIDTH = std::max<int>(548, GAME_PLOT.right + LEGEND_WIDTH + 10);  // fits the settings rows too
 static const char* const SETTINGS_CLASS = "SoftwareESSAdapterSettings";
@@ -279,8 +288,10 @@ static void save_settings() {
     auto write = [&](const char* key, int value) {
         WritePrivateProfileStringA(SETTINGS_SECTION, key, std::to_string(value).c_str(), path.c_str());
     };
-    write(KEY_GAME, g_game == Game::SoH ? 1 : 0);
-    write(KEY_INPUT_LAG, g_input_lag);
+    if (SOH_FEATURES) {
+        write(KEY_GAME, g_game == Game::SoH ? 1 : 0);
+        write(KEY_INPUT_LAG, g_input_lag);
+    }
     write(KEY_SNAP_DISTANCE, g_snap_distance);
     write(KEY_RANGE_START, g_range_start);
     write(KEY_RANGE_END, g_range_end);
@@ -292,8 +303,9 @@ static void load_settings() {
     auto read = [&](const char* key, int fallback) {
         return static_cast<int>(GetPrivateProfileIntA(SETTINGS_SECTION, key, fallback, path.c_str()));
     };
-    g_game = read(KEY_GAME, 0) == 1 ? Game::SoH : Game::WiiVC;
-    g_input_lag = read(KEY_INPUT_LAG, 0);
+    // A settings file from a dev build may still say SoH; other builds leave it alone and play on VC.
+    g_game = SOH_FEATURES && read(KEY_GAME, 0) == 1 ? Game::SoH : Game::WiiVC;
+    g_input_lag = SOH_FEATURES ? read(KEY_INPUT_LAG, 0) : 0;
     g_snap_distance = read(KEY_SNAP_DISTANCE, DEFAULT_SNAP_DISTANCE);
     g_range_start = read(KEY_RANGE_START, default_ess_start(g_game));
     g_range_end = read(KEY_RANGE_END, ESS_IN_GAME_END);
@@ -682,6 +694,9 @@ static void bridge_loop() {
 }
 
 static void set_text(HWND hwnd, int id, const std::string& text) {
+    if (!GetDlgItem(hwnd, id)) {
+        return;  // a control only dev builds have
+    }
     char current[256];
     GetDlgItemTextA(hwnd, id, current, sizeof(current));
     if (text != current) {
@@ -815,9 +830,10 @@ static void refresh_settings(HWND hwnd) {
     for (const Stepper& stepper : STEPPERS) {
         for (const int id : {stepper.minus, stepper.plus}) {
             const bool at_limit = limit_reason(id) != nullptr;
-            if (at_limit != shown_at_limit[button]) {
+            HWND control = GetDlgItem(hwnd, id);  // null for a button only dev builds have
+            if (control && at_limit != shown_at_limit[button]) {
                 shown_at_limit[button] = at_limit;
-                InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
+                InvalidateRect(control, nullptr, TRUE);
             }
             ++button;
         }
@@ -1299,13 +1315,15 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
             stepper(control_x, 194, ID_DEAD_ZONE_MINUS, ID_DEAD_ZONE_VALUE, ID_DEAD_ZONE_PLUS);
             add_dim_text(hwnd, "in game, 0 = off", hint_x, 197, 115, 18, ID_DEAD_ZONE_HINT);
 
-            add_control(hwnd, "STATIC", "Playing on", 0, label_x, 227, 130, 18, ID_GAME_LABEL);
-            add_control(hwnd, "BUTTON", "Dolphin (Wii VC)", BS_OWNERDRAW, control_x, 224, 130, 22, ID_GAME_VC);
-            add_control(hwnd, "BUTTON", "Ship of Harkinian", BS_OWNERDRAW, control_x + 134, 224, 130, 22, ID_GAME_SOH);
+            if (SOH_FEATURES) {
+                add_control(hwnd, "STATIC", "Playing on", 0, label_x, 227, 130, 18, ID_GAME_LABEL);
+                add_control(hwnd, "BUTTON", "Dolphin (Wii VC)", BS_OWNERDRAW, control_x, 224, 130, 22, ID_GAME_VC);
+                add_control(hwnd, "BUTTON", "Ship of Harkinian", BS_OWNERDRAW, control_x + 134, 224, 130, 22, ID_GAME_SOH);
 
-            add_control(hwnd, "STATIC", "Input lag", 0, label_x, 257, 130, 18, ID_LAG_LABEL);
-            stepper(control_x, 254, ID_LAG_MINUS, ID_LAG_VALUE, ID_LAG_PLUS);
-            add_dim_text(hwnd, "ms, SoH only, 0 = off", hint_x, 257, 115, 18, ID_LAG_HINT);
+                add_control(hwnd, "STATIC", "Input lag", 0, label_x, 257, 130, 18, ID_LAG_LABEL);
+                stepper(control_x, 254, ID_LAG_MINUS, ID_LAG_VALUE, ID_LAG_PLUS);
+                add_dim_text(hwnd, "ms, SoH only, 0 = off", hint_x, 257, 115, 18, ID_LAG_HINT);
+            }
         }
         add_control(hwnd, "STATIC", "", 0, STICK_PLOT.left, STICK_PLOT.top - 20, 250, 18, ID_STICK_PLOT_TITLE);
         add_control(hwnd, "STATIC", "", 0, GAME_PLOT.left, GAME_PLOT.top - 20, 250, 18, ID_GAME_PLOT_TITLE);

@@ -3,15 +3,20 @@
 # or MinGW-w64 g++ on PATH. MSVC wins if both are there, since releases are built with it too.
 #
 # --output <name> names the zip instead: .\build.ps1 --output demo writes dist/demo.zip.
+# --dev builds the Ship of Harkinian features (SoH output and input lag), which stay out of release
+# builds until SoH's DSU input is in an official libultraship release.
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 $zip_name = "software-ess-adapter"
+$dev = $false
 for ($i = 0; $i -lt $args.Count; $i++) {
     if ($args[$i] -eq "--output" -and $i + 1 -lt $args.Count) {
         $zip_name = $args[++$i] -replace "\.zip$", ""
+    } elseif ($args[$i] -eq "--dev") {
+        $dev = $true
     } else {
-        Write-Error "Unknown argument '$($args[$i])'. Usage: .\build.ps1 [--output <zip name>]"
+        Write-Error "Unknown argument '$($args[$i])'. Usage: .\build.ps1 [--output <zip name>] [--dev]"
     }
 }
 
@@ -45,7 +50,9 @@ if (Get-Command cl -ErrorAction SilentlyContinue) {
     $compilers = "-DCMAKE_C_COMPILER=gcc", "-DCMAKE_CXX_COMPILER=g++"
 }
 
-cmake -S . -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release @compilers
+# Always pass SOH_DEV, so a build folder once configured with --dev doesn't keep it.
+$soh_dev = if ($dev) { "ON" } else { "OFF" }
+cmake -S . -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DSOH_DEV=$soh_dev" @compilers
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 cmake --build $build --target software-ess-adapter
@@ -59,4 +66,5 @@ Copy-Item "dolphin/Software ESS Adapter.ini" "$stage/dolphin"
 
 New-Item dist -ItemType Directory -Force | Out-Null
 Compress-Archive "$stage/*" "dist/$zip_name.zip" -Force
-Write-Host "Built $PSScriptRoot\dist\$zip_name.zip ($build)"
+$kind = if ($dev) { "$build, dev" } else { $build }
+Write-Host "Built $PSScriptRoot\dist\$zip_name.zip ($kind)"

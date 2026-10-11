@@ -61,6 +61,12 @@ add_executable(software-ess-adapter WIN32 src/main.cpp assets/resources.rc)
 set_target_properties(software-ess-adapter PROPERTIES OUTPUT_NAME "Software ESS Adapter")
 target_link_libraries(software-ess-adapter PRIVATE bridge_core dwmapi shell32)
 target_compile_definitions(software-ess-adapter PRIVATE APP_VERSION="${APP_VERSION}")
+# Ship of Harkinian output and input lag, off until SoH's DSU input is in an official libultraship
+# release. build.ps1 --dev turns it on.
+option(SOH_DEV "Build the Ship of Harkinian features" OFF)
+if(SOH_DEV)
+  target_compile_definitions(software-ess-adapter PRIVATE SOH_DEV)
+endif()
 
 add_executable(bridge-tests test/bridge_tests.cpp)
 target_link_libraries(bridge-tests PRIVATE bridge_core)
