@@ -1,0 +1,6 @@
+# Lets the logged-in user use the official Gamecube controller adapter (WUP-028) without root, for
+# Software ESS Adapter and Dolphin alike. Install with:
+#   sudo cp 51-gcadapter.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug the adapter and plug it back in.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="0337", TAG+="uaccess"

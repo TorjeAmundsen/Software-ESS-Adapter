@@ -77,12 +77,20 @@ bool GCAdapter::open() {
         handle_ = nullptr;
         return false;
     }
+    if (ret == LIBUSB_ERROR_ACCESS) {
+        error_ = "No permission to use the adapter. Install the udev rule that comes with the program (see its README).";
+        handle_ = nullptr;
+        return false;
+    }
     if (ret != LIBUSB_SUCCESS) {
         error_ = "Can't open the adapter. Unplug it, plug it back in, and wait a moment.";
         handle_ = nullptr;
         return false;
     }
 
+    // On Linux the kernel's HID driver may hold the adapter. Let libusb unbind it while we have the
+    // adapter, as Dolphin does. Windows doesn't support this and doesn't need it.
+    libusb_set_auto_detach_kernel_driver(handle_, 1);
     ret = libusb_claim_interface(handle_, 0);
     if (ret != LIBUSB_SUCCESS) {
         error_ = "The adapter is in use, probably by Dolphin. Set Dolphin's ports to Standard Controller.";

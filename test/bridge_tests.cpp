@@ -8,22 +8,32 @@
 //    rule that each axis's in-game value follows its input.
 // 3. Talks to DsuServer like Dolphin does and checks the pad data that comes back.
 
+#ifdef _WIN32
 #include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <initializer_list>
 #include <mutex>
 #include <vector>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "delayed_sender.hpp"
 #include "dsu_server.hpp"
 #include "ess.hpp"
 #include "ess_range.hpp"
+#include "ini.hpp"
 #include "notch.hpp"
 #include "soh.hpp"
 #include "stick.hpp"
@@ -604,8 +614,12 @@ static void test_dsu_server() {
     CHECK(server.start(port));
 
     SOCKET client = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    DWORD timeout_ms = 1000;
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+#ifdef _WIN32
+    DWORD timeout = 1000;  // milliseconds
+#else
+    timeval timeout = {1, 0};
+#endif
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -648,7 +662,7 @@ static void test_dsu_server() {
     req[20] = 1;  // by pad id
     req[21] = 1;
     send(client, reinterpret_cast<char*>(req), 28, 0);
-    Sleep(100);  // let the server thread register us
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // let the server thread register us
     CHECK(server.client_count() == 1);
     server.publish(frame, VC);
     CHECK(server.is_transmitting());
@@ -672,7 +686,11 @@ static void test_dsu_server() {
         CHECK(!"no pad data for SoH");
     }
 
+#ifdef _WIN32
     closesocket(client);
+#else
+    close(client);
+#endif
     server.stop();
 }
 
@@ -865,6 +883,43 @@ static void test_axes_monotonic(Game game) {
     }
 }
 
+// The settings file reads like GetPrivateProfileString and edits only the line it changes.
+static void test_ini() {
+    const std::string path = "bridge-tests.ini";
+    std::ofstream(path, std::ios::binary) << "[Settings]\r\nSnapDistance = 3\r\nEssStartInGame=x\r\n\r\n[port1]\r\nEss=0\r\n";
+    auto contents = [&] {
+        std::ostringstream text;
+        text << std::ifstream(path, std::ios::binary).rdbuf();
+        return text.str();
+    };
+    CHECK(ini_read(path, "settings", "snapdistance") == "3");
+    CHECK(ini_read_int(path, "Settings", "SnapDistance", 9) == 3);
+    CHECK(ini_read_int(path, "Settings", "EssStartInGame", 9) == 9);  // not a number
+    CHECK(ini_read_int(path, "Settings", "Missing", 9) == 9);
+    CHECK(ini_read_int(path, "Port1", "Ess", 1) == 0);
+    CHECK(!ini_read(path, "Port2", "Ess"));
+    CHECK(!ini_read("no such file.ini", "Settings", "SnapDistance"));
+
+    // Written back with the platform's line endings.
+#ifdef _WIN32
+    const std::string nl = "\r\n";
+#else
+    const std::string nl = "\n";
+#endif
+    ini_write(path, "Settings", "SnapDistance", "4");    // replaced in place
+    ini_write(path, "Settings", "DeadZoneInGame", "2");  // after the section's last entry
+    ini_write(path, "Port1", "Ess", std::nullopt);       // removed
+    ini_write(path, "Port1", "Notches", std::nullopt);   // nothing to remove
+    ini_write(path, "Port2", "Ess", "1");                // a new section at the end
+    CHECK(contents() == "[Settings]" + nl + "SnapDistance=4" + nl + "EssStartInGame=x" + nl + "DeadZoneInGame=2" + nl + nl + "[port1]" + nl +
+                            "[Port2]" + nl + "Ess=1" + nl);
+
+    std::remove(path.c_str());
+    ini_write(path, "Settings", "Game", "1");  // a new file
+    CHECK(contents() == "[Settings]" + nl + "Game=1" + nl);
+    std::remove(path.c_str());
+}
+
 static void test_delayed_sender() {
     using namespace std::chrono;
     struct Sent {
@@ -895,9 +950,9 @@ static void test_delayed_sender() {
         for (int id = 2; id < 12; ++id) {
             pushed.push_back(steady_clock::now());
             sender.push(frame_with_id(id), SOH, milliseconds(30));
-            Sleep(4);
+            std::this_thread::sleep_for(milliseconds(4));
         }
-        Sleep(80);
+        std::this_thread::sleep_for(milliseconds(80));
         {
             std::lock_guard lock(mutex);
             CHECK(sent.size() == 11);
@@ -906,7 +961,7 @@ static void test_delayed_sender() {
             for (size_t i = 1; i < sent.size() && on_time; ++i) {
                 const auto late = duration_cast<microseconds>(sent[i].at - (pushed[i - 1] + milliseconds(30))).count();
                 on_time = sent[i].id == static_cast<int>(i) + 1 && sent[i].game == SOH && late >= 0;
-                worst_late_us = std::max(worst_late_us, late);
+                worst_late_us = std::max<long long>(worst_late_us, late);
             }
             std::printf("input lag: worst %lld us late\n", worst_late_us);
             CHECK(on_time);
@@ -917,15 +972,17 @@ static void test_delayed_sender() {
         // waits 50 ms, then frame 13 with no lag goes out at once and 12 never does.
         sender.push(frame_with_id(12), SOH, milliseconds(50));
         sender.push(frame_with_id(13), SOH, microseconds(0));
-        Sleep(80);
+        std::this_thread::sleep_for(milliseconds(80));
         std::lock_guard lock(mutex);
         CHECK(sent.size() == 12 && sent.back().id == 13);
     }
 }
 
 int main() {
+#ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
     test_dolphin_round_trip();
     test_ess_center();
     test_make_calibration();
@@ -938,9 +995,12 @@ int main() {
         test_ess_range(game);
         test_axes_monotonic(game);
     }
+    test_ini();
     test_dsu_server();
     test_delayed_sender();
+#ifdef _WIN32
     WSACleanup();
+#endif
     std::printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures ? 1 : 0;
 }

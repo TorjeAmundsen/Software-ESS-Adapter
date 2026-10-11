@@ -2,7 +2,3 @@
 
 // App icon, made from icon.svg. Keep it first: Windows Explorer shows the first icon in the exe.
 APP_ICON ICON "icon.ico"
-
-// License texts shown from the About window.
-GPL_TEXT RCDATA "../LICENSE.md"
-THIRD_PARTY_TEXT RCDATA "licenses/third-party.txt"

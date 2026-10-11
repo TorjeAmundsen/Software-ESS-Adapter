@@ -15,7 +15,13 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
 #include <winsock2.h>
+#else
+#include <netinet/in.h>
+using SOCKET = int;
+constexpr SOCKET INVALID_SOCKET = -1;
+#endif
 
 #include "game.hpp"
 #include "gc_adapter.hpp"

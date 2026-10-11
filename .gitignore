@@ -8,6 +8,7 @@ out/
 
 # Personal settings and calibration the program writes next to the exe
 /Software ESS Adapter settings.ini
+/software-ess-adapter-settings.ini
 /ess-dolphin-bridge.ini
 
 # Editor and tool files

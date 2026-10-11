@@ -4,7 +4,13 @@
 
 #include "dsu_server.hpp"
 
+#ifdef _WIN32
 #include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -125,12 +131,14 @@ DsuServer::~DsuServer() {
 }
 
 bool DsuServer::start(uint16_t port) {
+#ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         error_ = "Networking failed to start, so Dolphin can't connect. Restart the program.";
         return false;
     }
     winsock_started_ = true;
+#endif
 
     socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     sockaddr_in addr = {};
@@ -145,8 +153,12 @@ bool DsuServer::start(uint16_t port) {
     }
 
     // Wake up regularly so stop() does not hang in recvfrom.
-    DWORD timeout_ms = 200;
-    setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+#ifdef _WIN32
+    DWORD timeout = 200;  // milliseconds
+#else
+    timeval timeout = {0, 200000};
+#endif
+    setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
 
     server_id_ = std::random_device{}();
     running_ = true;
@@ -160,20 +172,26 @@ void DsuServer::stop() {
         thread_.join();
     }
     if (socket_ != INVALID_SOCKET) {
+#ifdef _WIN32
         closesocket(socket_);
+#else
+        close(socket_);
+#endif
         socket_ = INVALID_SOCKET;
     }
+#ifdef _WIN32
     if (winsock_started_) {
         WSACleanup();
         winsock_started_ = false;
     }
+#endif
 }
 
 void DsuServer::receive_loop() {
     uint8_t buffer[512];
     while (running_) {
         sockaddr_in from = {};
-        int from_len = sizeof(from);
+        socklen_t from_len = sizeof(from);
         const int size =
             recvfrom(socket_, reinterpret_cast<char*>(buffer), sizeof(buffer), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
         if (size > 0) {

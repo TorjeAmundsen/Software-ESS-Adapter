@@ -4,22 +4,26 @@
 
 #include "delayed_sender.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 
 // Newer Windows SDK value that older mingw-w64 headers don't have.
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#if defined(_WIN32) && !defined(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
 DelayedSender::DelayedSender(Send send) : send_(std::move(send)) {
+#ifdef _WIN32
     // Without high-resolution support (before Windows 10 1803) a normal timer still works, just
     // less precisely.
     timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!timer_) {
         timer_ = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     }
+#endif
     thread_ = std::thread(&DelayedSender::run, this);
 }
 
@@ -30,7 +34,9 @@ DelayedSender::~DelayedSender() {
     }
     wake_.notify_one();
     thread_.join();
+#ifdef _WIN32
     CloseHandle(timer_);
+#endif
 }
 
 void DelayedSender::push(const AdapterFrame& frame, Game game, std::chrono::microseconds lag) {
@@ -72,10 +78,14 @@ void DelayedSender::run() {
         }
         const auto wait = std::min<std::chrono::steady_clock::duration>(pending_.front().due - now, LONGEST_WAIT);
         lock.unlock();
+#ifdef _WIN32
         LARGE_INTEGER due;  // negative = relative, in 100 ns units
         due.QuadPart = -std::max<LONGLONG>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(wait).count() / 100);
         SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE);
         WaitForSingleObject(timer_, INFINITE);
+#else
+        std::this_thread::sleep_for(wait);  // already precise on Linux
+#endif
         lock.lock();
     }
 }

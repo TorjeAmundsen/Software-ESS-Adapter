@@ -41,7 +41,7 @@ private:
     void run();
 
     Send send_;
-    void* timer_ = nullptr;  // a Windows waitable timer, high resolution where supported
+    void* timer_ = nullptr;  // Windows only: a waitable timer, high resolution where supported
     std::mutex mutex_;       // guards everything below
     std::condition_variable wake_;
     std::deque<Pending> pending_;

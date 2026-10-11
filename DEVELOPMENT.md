@@ -18,7 +18,7 @@ With "Playing on" set to Ship of Harkinian, there is no VC in between: the game 
 
 With those settings, libultraship reads a byte `v` as `(v-128)/127` of 85, clamped, and runs `ControllerStick::Process`: an octagon through 85, 0 and 69, 69, a trip through `atan2` and `cos`/`sin` past 90% of the range, and truncation to `int8_t`. `soh_in_game` in `soh.cpp` copies that math float for float. For each in-game pair, the table sends the byte pair furthest from a truncation edge and leaves out pairs within 1e-6 of one, so a build that rounds a last digit differently still reads the same. The octagon's corner, 69, 69, only comes out exactly on a truncation edge, so targets stay strictly inside the octagon, and a calibrated diagonal reads 68, 68 (70, 70 on N64). SoH reads bytes as they are, so `to_dolphin_stick` is skipped. SoH can produce 8, so there the default ESS range is 8 to 26.
 
-SoH answers the stick much sooner than Dolphin running Wii VC, so "Input lag" (SoH only, 0 to 100 ms, as in pyESS) delays everything that goes out, buttons and disconnects included. `DelayedSender` sends each frame exactly that long after it came in, from its own thread on a high-resolution waitable timer, so the lag isn't rounded to the adapter's report rate (the tests measure it under half a millisecond late). Changing the lag drops frames still waiting, so nothing goes out of order. The main window shows the lag next to the connection status. In the settings window, the "In game" plot and the Game readouts lag by the same amount (from the last 150 ms of processed frames), so they show what SoH has at that moment.
+SoH answers the stick much sooner than Dolphin running Wii VC, so "Input lag" (SoH only, 0 to 100 ms, as in pyESS) delays everything that goes out, buttons and disconnects included. `DelayedSender` sends each frame exactly that long after it came in, from its own thread on a high-resolution waitable timer (a plain sleep on Linux, which is already precise), so the lag isn't rounded to the adapter's report rate (the tests measure it under half a millisecond late). Changing the lag drops frames still waiting, so nothing goes out of order. The main window shows the lag next to the connection status. In the settings window, the "In game" plot and the Game readouts lag by the same amount (from the last 150 ms of processed frames), so they show what SoH has at that moment.
 
 ### Centering
 
@@ -52,6 +52,10 @@ DSU copies a PlayStation controller, so Gamecube buttons go out under PlayStatio
 
 ## Build
 
+The windows are drawn with [FLTK](https://www.fltk.org) 1.4, which CMake downloads and links in statically, along with the fonts in `assets/fonts` (see Drawing the windows below).
+
+### Windows
+
 You need CMake 3.20+, Ninja, and a C++17 compiler. Either works:
 
 - **MSVC**, from Visual Studio with the "Desktop development with C++" workload. `build.ps1` finds it on its own, no developer prompt needed. Releases are built with MSVC, so it's preferred when both are installed.
@@ -72,7 +76,38 @@ cmake --build build/mingw --target bridge-tests
 
 With MSVC, use `build/msvc` instead.
 
-CMake downloads libusb 1.0.27 and compiles its Windows sources directly, since libusb has no CMake build. libusb only ships a `config.h` for MSVC, so `cmake/libusb-mingw/config.h` provides the same settings for MinGW. To build offline, point CMake at any libusb checkout, for example Dolphin's, with `-DFETCHCONTENT_SOURCE_DIR_LIBUSB="<dolphin>/Externals/libusb/libusb"`.
+CMake downloads libusb 1.0.27 and compiles its Windows sources directly, since libusb has no CMake build. libusb only ships a `config.h` for MSVC, so `cmake/libusb-mingw/config.h` provides the same settings for MinGW. To build offline, point CMake at any libusb checkout, for example Dolphin's, with `-DFETCHCONTENT_SOURCE_DIR_LIBUSB="<dolphin>/Externals/libusb/libusb"`, and at an FLTK 1.4.5 checkout with `-DFETCHCONTENT_SOURCE_DIR_FLTK=<fltk>`.
+
+### Linux
+
+You need CMake 3.20+, Ninja, g++ 9 or newer, and the development packages for libusb and FLTK. On Ubuntu or Debian:
+
+```
+sudo apt install cmake ninja-build g++ libusb-1.0-0-dev libfontconfig-dev libx11-dev libxext-dev libxft-dev \
+  libxinerama-dev libxcursor-dev libxrender-dev libxfixes-dev libpango1.0-dev libcairo2-dev libwayland-dev \
+  wayland-protocols libxkbcommon-dev libdbus-1-dev libgtk-3-dev
+```
+
+```
+./build.sh
+```
+
+This builds the program in `build/linux` and writes `dist/software-ess-adapter.tar.gz` with the program, the Dolphin profile, and the udev rule (`linux/51-gcadapter.rules`). `--output` and `--dev` work as in `build.ps1`. libstdc++ is linked in, and libusb and the desktop libraries come from the system. Releases are built on Ubuntu 22.04, so they run on distros with that glibc (2.35) or newer. To run the tests:
+
+```
+cmake --build build/linux --target bridge-tests
+./build/linux/bridge-tests
+```
+
+FLTK runs on Wayland when there is one, and on X11 otherwise. `FLTK_BACKEND=x11` forces X11. On Wayland the desktop places every window, so the notch offsets window can't open beside the settings window as it does elsewhere. FLTK 1.4.5's Wayland build breaks in a folder whose path has a space, which `cmake/patch-fltk.cmake` fixes when CMake downloads it.
+
+### Drawing the windows
+
+`src/main.cpp` draws every control itself, at fixed pixel positions, in the colors and layout of the original Win32 version. The Win32 version used Segoe UI and Consolas, which Linux doesn't have, so the program brings its own fonts, the same on both platforms: [Selawik](https://github.com/microsoft/Selawik) (Microsoft's open font with Segoe UI's widths) and [Cascadia Mono](https://github.com/microsoft/cascadia-code) SemiLight (about as light as Consolas). `font_layout` places text with Segoe UI's and Consolas' own measurements (baseline and line spacing), so text sits where it did. Windows takes the fonts from memory (`AddFontMemResourceEx`). Linux writes them to the user's runtime folder (`$XDG_RUNTIME_DIR/software-ess-adapter`) for fontconfig, which only reads files.
+
+`cmake/embed.cmake` builds the fonts, `LICENSE.md`, `assets/licenses/third-party.txt`, and the Linux window icon (`assets/icon.png`) into the program as byte arrays (`src/embedded.hpp`), so a release is still one file plus the Dolphin profile.
+
+The windows refresh 60 times a second from a thread on a high-resolution timer that wakes the UI thread (`Fl::awake`), since FLTK's timers on Windows wait in whole 15.6 ms ticks. On Windows a window hook makes the title bars dark and leaves the minimize button to the main window, as before.
 
 ## Releases
 
@@ -88,9 +123,9 @@ To release:
    git push origin v0.1.0-alpha
    ```
 
-The Release workflow (`.github/workflows/release.yml`) checks that the tag is exactly `v` plus `APP_VERSION`, runs the tests, builds `software-ess-adapter-v0.1.0-alpha-win-x64.zip`, and creates a draft GitHub release with it. Review the draft and publish it. A version with a suffix becomes a prerelease.
+The Release workflow (`.github/workflows/release.yml`) checks that the tag is exactly `v` plus `APP_VERSION`, runs the tests on both platforms, builds `software-ess-adapter-v0.1.0-alpha-win-x64.zip` and `software-ess-adapter-v0.1.0-alpha-linux-x64.tar.gz`, and creates a draft GitHub release with them. Review the draft and publish it. A version with a suffix becomes a prerelease.
 
-The Validate workflow (`.github/workflows/validate.yml`) builds and runs the tests on every pull request and every push to `main`.
+The Validate workflow (`.github/workflows/validate.yml`) builds and runs the tests on Windows and Linux on every pull request and every push to `main`.
 
 ## Code style
 
@@ -107,21 +142,28 @@ The style is in `.clang-format`: 4-space indents, 140-column lines, and braces o
 - `src/stick.cpp` has `process_stick`: the main stick's path from the centered stick to what goes to the game (notch warp, snapping, ESS range, software dead zone, ESS map, then, ESS on or off, a pass that keeps each axis's in-game value, after Wii VC or SoH, from ever moving the opposite way to its own input, as the speedrun rules require). That pass is worked out for every stick position at once, into a table per settings and calibration, which takes a few milliseconds the first time each combination is used (around 50 at most). Near VC's length limit a position can be boxed in: x has to reach as far out as one neighbor and y as far out as another, and VC can't do both. Then the positions further in on the axis that fell short get bounded and the table is worked out again, until nothing is boxed in. The tests sweep every raw stick position for fixed and 150 random settings and calibrations, for each game. The bridge loop and the tests both call it.
 - `src/notch.cpp` has notch calibration, the notch warp, and snapping. The warp splits the stick into 8 slices between neighboring notches and the center, and maps each slice linearly so its two calibrated notches land on their targets (the ideal notches plus any notch offsets).
 - `src/main.cpp` has the windows, calibration, the settings file, and the bridge loop: read the adapter, center each stick, `process_stick`, send to the game.
+- `src/ini.cpp` reads and writes the settings file the way Windows' `GetPrivateProfileString` and `WritePrivateProfileString` do, so settings files from the Win32 version keep working.
+- `src/embedded.hpp` declares the files `cmake/embed.cmake` builds into the program.
 - `src/resource.h` has the resource ids shared by `assets/resources.rc` and the code.
 - `test/bridge_tests.cpp` has the tests.
-- `assets/icon.svg` is the app icon: a GameCube control stick in its octagonal gate. `assets/icon.ico` is made from it and committed, so building doesn't need any image tools. `assets/resources.rc` puts it in the exe. After changing the SVG, regenerate the `.ico` with ImageMagick:
+- `assets/icon.svg` is the app icon: a GameCube control stick in its octagonal gate. `assets/icon.ico` (Windows) and `assets/icon.png` (the Linux window icon, 64 px) are made from it and committed, so building doesn't need any image tools. `assets/resources.rc` puts the `.ico` in the exe. After changing the SVG, regenerate both with ImageMagick:
 
   ```
   magick -background none -density 384 assets/icon.svg -define icon:auto-resize=256,64,48,32,24,16 assets/icon.ico
+  magick "assets/icon.ico[1]" -strip assets/icon.png
   ```
+- `linux/51-gcadapter.rules` is the udev rule that lets the logged-in user open the adapter on Linux.
 
 ## Licenses
 
-The program is GPLv3 (`LICENSE.md`). The release zip has no separate license files. Instead, `assets/resources.rc` builds `LICENSE.md` and `assets/licenses/third-party.txt` into the exe, and the About window shows the credits, the no-warranty notice, and the source link, as GPLv3 asks of interactive programs. Its Licenses button writes both texts to a temporary text file and opens it in the default text editor.
+The program is GPLv3 (`LICENSE.md`). The release downloads have no separate license files. Instead, `cmake/embed.cmake` builds `LICENSE.md` and `assets/licenses/third-party.txt` into the program, and the About window shows the credits, the no-warranty notice, and the source link, as GPLv3 asks of interactive programs. Its Licenses button writes both texts to a temporary text file and opens it in the default text editor.
 
-`assets/licenses/third-party.txt` covers what ends up inside the exe:
+`assets/licenses/third-party.txt` covers what ends up inside the program:
 
-- **libusb:** LGPL 2.1, built in from source. Its copyright lines come from libusb's `AUTHORS`, and the license text from its `COPYING`.
+- **libusb:** LGPL 2.1, built in from source on Windows (Linux uses the system's). Its copyright lines come from libusb's `AUTHORS`, and the license text from its `COPYING`.
+- **FLTK:** LGPL 2 with FLTK's exceptions, which allow static linking, from FLTK's `COPYING`.
+- **libpng, zlib, and libdecor:** only in the Linux build, from the copies FLTK includes (`png/LICENSE`, the notice in `zlib/zlib.h`, `libdecor/LICENSE`).
+- **Selawik and Cascadia Mono:** SIL Open Font License 1.1, from each font's repository. Both have Reserved Font Names, so the font files stay unmodified (no subsetting).
 - **MinGW-w64 runtime and winpthreads:** only in MinGW builds, from MSYS2's `share/licenses/crt/COPYING.MinGW-w64-runtime.txt` and `share/licenses/winpthreads/COPYING`.
 
-The GCC runtime needs no notice (GCC Runtime Library Exception), and MSVC's runtime needs none either. If you update libusb or change toolchains, update this file to match.
+The GCC runtime needs no notice (GCC Runtime Library Exception), and MSVC's runtime needs none either. If you update a library or font, or change toolchains, update this file to match.
