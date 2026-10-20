@@ -87,9 +87,27 @@ double dead_zone_after_range(Game game, int distance, int start);
 // and VC treat each axis separately).
 void apply_dead_zone(uint8_t stick[2], double distance);
 
-// Requires 1 <= start < end <= ESS_MAX_END, in physical distances. Distances below start
-// become dead zone, [start, end] becomes ESS, and above end is stretched out to full tilt
-// (105), which stays where it is. Start and end are cardinal distances. In other directions they
-// scale with where the stock map's ESS starts and ends there, so the range keeps the stock map's
-// ESS shape all the way around.
-void remap_ess_range(Game game, uint8_t stick[2], int start, int end);
+// Full speed distance: the first stick distance on a cardinal where Link runs at full speed. The
+// stock map goes full speed from 87 on the Wii VC and 86 on SoH. AUTO_FULL_SPEED keeps the stock
+// map's proportions: everything past the ESS end is spread evenly out to full tilt, so a wider
+// ESS range reaches full speed a little sooner. A set distance needs MIN_FULL_SPEED_GAP units past
+// the ESS end, so walking and running keep some of the stick, and goes up to
+// MAX_FULL_SPEED_START, so full speed does too.
+constexpr int AUTO_FULL_SPEED = -1;
+constexpr int MIN_FULL_SPEED_GAP = 4;
+constexpr int MAX_FULL_SPEED_START = 100;
+// First physical distance where the stock map goes full speed on a cardinal.
+int stock_full_speed_start(Game game);
+// The full speed distance AUTO_FULL_SPEED gives with this ESS range end (a physical distance).
+double auto_full_speed_start(Game game, int end);
+int min_full_speed_start(int end);
+
+// Requires 1 <= start < end <= ESS_MAX_END, in physical distances, and a full speed distance of
+// AUTO_FULL_SPEED or min_full_speed_start(end) to MAX_FULL_SPEED_START. Distances below start
+// become dead zone, [start, end] becomes ESS, then walking and running split the way the stock map
+// splits them up to the full speed distance, then full speed out to full tilt (105), which stays
+// where it is. With AUTO_FULL_SPEED, or a distance equal to it rounded, everything past the end is
+// spread evenly out to full tilt instead. Start, end and the full speed distance are cardinal
+// distances. In other directions they scale with where the stock map's ESS starts and ends and
+// full speed starts there, so the zones keep the stock map's shape all the way around.
+void remap_ess_range(Game game, uint8_t stick[2], int start, int end, int full_speed = AUTO_FULL_SPEED);

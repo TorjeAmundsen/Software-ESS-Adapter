@@ -803,6 +803,11 @@ static void test_axes_monotonic(Game game) {
     boxed_in_settings.range_start = physical_start(game, 5);
     boxed_in_settings.range_end = physical_end(game, 35);
     boxed_in_settings.dead_zone_distance = physical_dead_zone(game, 4);
+    // Full speed as soon as it goes past a wide ESS range, and as late as it goes.
+    StickSettings full_speed_soonest = wide;
+    full_speed_soonest.full_speed_start = min_full_speed_start(full_speed_soonest.range_end);
+    StickSettings full_speed_latest = defaults;
+    full_speed_latest.full_speed_start = MAX_FULL_SPEED_START;
 
     const struct {
         const char* name;
@@ -816,7 +821,14 @@ static void test_axes_monotonic(Game game) {
                  {"turned notches, ESS off, snap 5", turned, ess_off},
                  {"big offsets, snap 5", offsets, snapping},
                  {"big offsets, ESS off, snap 5", offsets, ess_off},
-                 {"boxed in", boxed_in, boxed_in_settings}};
+                 {"boxed in", boxed_in, boxed_in_settings},
+                 {"ESS range 9 to 40, soonest full speed", NotchCalibration{}, full_speed_soonest},
+                 {"latest full speed", NotchCalibration{}, full_speed_latest},
+                 {"latest full speed, big offsets, snap 5", offsets, [&] {
+                      StickSettings s = snapping;
+                      s.full_speed_start = MAX_FULL_SPEED_START;
+                      return s;
+                  }()}};
     for (const auto& c : cases) {
         CHECK(monotonic_breaks(c.name, c.cal, c.settings) == 0);
     }
@@ -857,6 +869,7 @@ static void test_axes_monotonic(Game game) {
         settings.range_start = physical_start(game, start);
         settings.range_end = std::max(physical_end(game, end), settings.range_start + 1);
         settings.dead_zone_distance = physical_dead_zone(game, random(0, start - 1));
+        settings.full_speed_start = random(0, 2) == 0 ? AUTO_FULL_SPEED : random(min_full_speed_start(settings.range_end), MAX_FULL_SPEED_START);
         const std::string name = "random case " + std::to_string(n);
         CHECK(monotonic_breaks(name.c_str(), cal, settings) == 0);
     }
@@ -880,6 +893,58 @@ static void test_axes_monotonic(Game game) {
             }
         }
         CHECK(same);
+    }
+}
+
+// On a cardinal, a set full speed distance is the first distance that goes full speed, with
+// walking and running before it, in that order. Automatic keeps the stock map's distance with the
+// stock range.
+static void test_full_speed(Game game) {
+    const char* game_name = game == Game::SoH ? "SoH" : "VC";
+    CHECK(stock_full_speed_start(game) == (game == Game::SoH ? 86 : 87));
+    CHECK(std::lround(auto_full_speed_start(game, stock_ess_end(game))) == stock_full_speed_start(game));
+    for (const int end : {stock_ess_end(game), physical_end(game, 40), physical_end(game, max_in_game_end(game))}) {
+        for (const int full_speed : {min_full_speed_start(end), 70, 81, 90, MAX_FULL_SPEED_START}) {
+            if (full_speed < min_full_speed_start(end)) {
+                continue;
+            }
+            int walking = 0, running = 0, first_full_speed = -1, backwards = 0;
+            OotZone last = OotZone::DeadZone;
+            for (int d = 0; d <= 104; ++d) {
+                uint8_t s[2] = {static_cast<uint8_t>(128 + d), 128};
+                remap_ess_range(game, s, stock_ess_start(game), end, full_speed);
+                const OotZone zone = oot_zone(stock_in_game(game, s[0] - 128), 0);
+                walking += zone == OotZone::Walk;
+                running += zone == OotZone::Run;
+                if (zone == OotZone::FullSpeed && first_full_speed < 0) {
+                    first_full_speed = d;
+                }
+                backwards += zone < last;
+                last = zone;
+            }
+            if (first_full_speed != full_speed || walking == 0 || running == 0 || backwards) {
+                std::printf("%s: end %d full speed %d goes full speed from %d, walks %d, runs %d, %d steps back\n", game_name, end,
+                            full_speed, first_full_speed, walking, running, backwards);
+                ++failures;
+            }
+        }
+
+        // Setting the distance automatic gives, rounded, changes nothing.
+        const int shown = static_cast<int>(std::lround(auto_full_speed_start(game, end)));
+        int differing = 0;
+        for (int x = 0; x < 256; ++x) {
+            for (int y = 0; y < 256; ++y) {
+                uint8_t automatic[2] = {static_cast<uint8_t>(x), static_cast<uint8_t>(y)};
+                uint8_t set[2] = {static_cast<uint8_t>(x), static_cast<uint8_t>(y)};
+                remap_ess_range(game, automatic, stock_ess_start(game), end, AUTO_FULL_SPEED);
+                remap_ess_range(game, set, stock_ess_start(game), end, shown);
+                differing += automatic[0] != set[0] || automatic[1] != set[1];
+            }
+        }
+        if (differing) {
+            std::printf("%s: end %d full speed %d (auto's) differs from auto at %d positions\n", game_name, end, shown, differing);
+            ++failures;
+        }
     }
 }
 
@@ -993,6 +1058,7 @@ int main() {
     test_soh();
     for (const Game game : {VC, SOH}) {
         test_ess_range(game);
+        test_full_speed(game);
         test_axes_monotonic(game);
     }
     test_ini();

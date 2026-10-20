@@ -83,9 +83,9 @@ struct Table {
 std::vector<int> table_key(const NotchCalibration& notches, const StickSettings& settings) {
     // The ESS range only matters with ESS on, so with ESS off changing it doesn't build a new table.
     const int range_start = settings.ess ? settings.range_start : 0, range_end = settings.ess ? settings.range_end : 0;
-    std::vector<int> key = {static_cast<int>(settings.game), settings.ess,       notches.valid,
-                            settings.snap_distance,          range_start,        range_end,
-                            settings.dead_zone_distance};
+    const int full_speed_start = settings.ess ? settings.full_speed_start : AUTO_FULL_SPEED;
+    std::vector<int> key = {static_cast<int>(settings.game), settings.ess, notches.valid, settings.snap_distance, range_start, range_end,
+                            full_speed_start,                settings.dead_zone_distance};
     for (int i = 0; i < NOTCH_COUNT; ++i) {
         key.insert(key.end(), {notches.notch[i][0], notches.notch[i][1], notches.offset[i][0], notches.offset[i][1]});
     }
@@ -93,17 +93,20 @@ std::vector<int> table_key(const NotchCalibration& notches, const StickSettings&
 }
 
 // The in-game values a position may take, per axis: lo[axis] to hi[axis], and the lowest zone
-// it may be in (see zone_rank).
+// it may be in (see zone_rank), up to `last_zone`.
 struct Box {
     int lo[2] = {-127, -127};
     int hi[2] = {127, 127};
     int min_zone = 0;
+    OotZone last_zone = OotZone::Run;
 };
 
 // The rule is there to keep dead zone, ESS, walking and running in that order, so a pair's place
-// in that order: 0 to 3, with full speed counted as running.
-int zone_rank(int x, int y) {
-    return std::min(static_cast<int>(oot_zone(x, y)), static_cast<int>(OotZone::Run));
+// in that order: 0 to 3, with full speed counted as running. With a set full speed distance, full
+// speed is kept after running too (4): moving the full speed edge far can leave a lone running
+// position past it.
+int zone_rank(int x, int y, OotZone last_zone) {
+    return std::min(static_cast<int>(oot_zone(x, y)), static_cast<int>(last_zone));
 }
 
 // How far a value is outside [lo, hi].
@@ -119,7 +122,7 @@ std::array<int, 2> closest_allowed(const Reachable& r, const std::array<int, 2>&
         return outside(x, box.lo[0], box.hi[0]) + outside(y, box.lo[1], box.hi[1]);
     };
     auto zones_short = [&](int x, int y) {
-        return box.min_zone > 0 ? std::max(0, box.min_zone - zone_rank(x, y)) : 0;
+        return box.min_zone > 0 ? std::max(0, box.min_zone - zone_rank(x, y, box.last_zone)) : 0;
     };
     std::array<int, 2> best = wanted;
     long long best_score = std::numeric_limits<long long>::max();
@@ -158,7 +161,7 @@ void calibrate(uint8_t stick[2], const NotchCalibration& notches, const StickSet
 void run_steps(uint8_t stick[2], const NotchCalibration& notches, const StickSettings& settings) {
     calibrate(stick, notches, settings);
     if (settings.ess) {
-        remap_ess_range(settings.game, stick, settings.range_start, settings.range_end);
+        remap_ess_range(settings.game, stick, settings.range_start, settings.range_end, settings.full_speed_start);
     }
     // The dead zone goes after everything that moves the stick, scaled along with the ESS range.
     const double dead_zone = settings.ess ? dead_zone_after_range(settings.game, settings.dead_zone_distance, settings.range_start)
@@ -226,10 +229,11 @@ Table build_table(const NotchCalibration& notches, const StickSettings& settings
                         const int step[2] = {sx * 256, sy};  // one position outward, in index units
 
                         Box box = bounds[index];
+                        box.last_zone = settings.ess && settings.full_speed_start != AUTO_FULL_SPEED ? OotZone::FullSpeed : OotZone::Run;
                         for (int axis = 0; axis < 2; ++axis) {
                             if (inner[axis] > 0) {
                                 const std::array<int, 2>& further_in = game[index - step[axis]];
-                                box.min_zone = std::max(box.min_zone, zone_rank(further_in[0], further_in[1]));
+                                box.min_zone = std::max(box.min_zone, zone_rank(further_in[0], further_in[1], box.last_zone));
                                 const int limit = further_in[axis];
                                 if (outward[axis] > 0) {
                                     box.lo[axis] = std::max(box.lo[axis], limit);
@@ -240,7 +244,7 @@ Table build_table(const NotchCalibration& notches, const StickSettings& settings
                         }
                         const std::array<int, 2>& normal = baseline[index];
                         if (outside(normal[0], box.lo[0], box.hi[0]) == 0 && outside(normal[1], box.lo[1], box.hi[1]) == 0 &&
-                            zone_rank(normal[0], normal[1]) >= box.min_zone) {
+                            zone_rank(normal[0], normal[1], box.last_zone) >= box.min_zone) {
                             // Nothing moves back: send the normal result unchanged.
                             game[index] = normal;
                             table.sent[2 * index] = steps[index][0];

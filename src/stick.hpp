@@ -17,6 +17,7 @@ struct StickSettings {
     int snap_distance = 0;
     int range_start = ESS_DEFAULT_START;  // physical distances, see ess_range.hpp (these are Wii VC's)
     int range_end = ESS_DEFAULT_END;
+    int full_speed_start = AUTO_FULL_SPEED;  // a physical distance, see ess_range.hpp
     int dead_zone_distance = 0;  // physical_dead_zone of the software dead zone
 };
 
