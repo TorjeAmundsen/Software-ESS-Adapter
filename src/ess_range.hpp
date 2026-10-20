@@ -7,10 +7,9 @@
 // This stretches the physical stick radially so that a chosen physical [start, end] lands on
 // that range, before the ESS map runs. Works on origin-centered stick bytes (128 = center).
 //
-// Users set start and end in in-game units: "start 6" means ESS begins where the stick
-// would normally read 6 in game. physical_start/physical_end convert those to stick distances.
-// The stock map reads differently on Wii VC and on Ship of Harkinian, so the conversions take the
-// game.
+// Users set it in stick units. The start is the stick distance where ESS begins, and the range is
+// how many distances it lasts, so the last ESS distance is start + range - 1. The stock map's ESS
+// runs from 11 to 34 on Wii VC, which never produces 8, and from 10 to 34 on Ship of Harkinian.
 
 #pragma once
 #include <cstdint>
@@ -20,15 +19,25 @@
 // The game's ESS range.
 constexpr int OOT_ESS_START = 8;
 constexpr int ESS_IN_GAME_END = 26;
-// The default range start: the first ESS value a player can actually reach. VC never produces 8,
-// so on Wii VC that is 9.
-int default_ess_start(Game game);
 
 // Physical distances where the stock ESS map enters and leaves the ESS range on a cardinal, on
 // Wii VC. stock_ess_start and stock_ess_end give them for either game.
 constexpr int ESS_DEFAULT_START = 11;
 constexpr int ESS_DEFAULT_END = 34;
 constexpr int ESS_MAX_END = 100;
+
+// The settings' defaults and limits, in stick units. With start 10 and range 25, ESS is the stock
+// map's on Ship of Harkinian and starts one distance sooner on Wii VC. The range goes up to 45,
+// and 0 means no ESS at all.
+constexpr int DEAD_ZONE_DEFAULT = 5;
+constexpr int ESS_START_DEFAULT = 10;
+constexpr int ESS_RANGE_DEFAULT = 25;
+constexpr int ESS_MAX_START = 50;
+constexpr int ESS_MAX_RANGE = 45;
+// The last ESS distance with this start and range. With range 0 it's start - 1, before the start.
+constexpr int ess_end(int start, int range) {
+    return start + range - 1;
+}
 
 // Physical distances where the stock ESS map enters and leaves the ESS range on a cardinal. The
 // remap is anchored on these, so a range of exactly these distances changes nothing.
@@ -67,18 +76,14 @@ int stock_in_game(Game game, int distance);
 int physical_start(Game game, int in_game);
 // Last physical distance where the stock map does not go past `in_game` (end of the range).
 int physical_end(Game game, int in_game);
-// Largest in-game end the settings allow: 45, as on ElectroModder's adapter, the reference for
-// ESS adapters.
-constexpr int ESS_IN_GAME_MAX_END = 45;
-int max_in_game_end(Game game);
 
-// Software dead zone, in the same in-game units as the ESS range: N covers where the stick would
-// normally read N or less in game, so with the default range a stick resting at 1, 1 shows 0, 0
-// in practice tools. It goes up to the ESS range start. Below the start, the ESS range stretches
-// the stick evenly onto the game's own dead zone (0 to 7), and the software dead zone is stretched
-// along with it: at range start - 1 it covers exactly that, and never any of ESS.
-constexpr int DEAD_ZONE_DEFAULT = 2;
-// Distance from center, per axis, below which the dead zone applies (0 = off).
+// The software dead zone is a distance from center, per axis. Closer than that on both axes, the
+// stick goes to center, and 0 turns it off. It goes up to the ESS range start. Below the start,
+// the ESS range stretches the stick evenly onto the game's own dead zone, 0 to 7, and stretches
+// the software dead zone with it. At the start it covers exactly the game's dead zone and never
+// any of ESS.
+// physical_dead_zone gives the distance that covers where the stock map reads `in_game` or less.
+// Only old settings files, which stored the dead zone in game units, need it.
 int physical_dead_zone(Game game, int in_game);
 // The dead zone distance after the ESS range has moved the stick: scaled like everything below
 // the range start, by stock_ess_start / start.
@@ -102,9 +107,9 @@ int stock_full_speed_start(Game game);
 double auto_full_speed_start(Game game, int end);
 int min_full_speed_start(int end);
 
-// Requires 1 <= start < end <= ESS_MAX_END, in physical distances, and a full speed distance of
-// AUTO_FULL_SPEED or min_full_speed_start(end) to MAX_FULL_SPEED_START. Distances below start
-// become dead zone, [start, end] becomes ESS, then walking and running split the way the stock map
+// Requires 1 <= start and start - 1 <= end <= ESS_MAX_END, in physical distances, where
+// end = start - 1 means no ESS at all. The full speed distance is AUTO_FULL_SPEED or
+// min_full_speed_start(end) to MAX_FULL_SPEED_START. Distances below start become dead zone, [start, end] becomes ESS, then walking and running split the way the stock map
 // splits them up to the full speed distance, then full speed out to full tilt (105), which stays
 // where it is. With AUTO_FULL_SPEED, or a distance equal to it rounded, everything past the end is
 // spread evenly out to full tilt instead. Start, end and the full speed distance are cardinal

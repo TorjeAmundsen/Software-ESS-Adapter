@@ -281,14 +281,13 @@ static void test_vc_and_conversion() {
     }
     CHECK(skipped);
 
-    // The default range, in-game 9 to 26 (8 is unreachable through VC), is the stock map's 11 to 34,
-    // so the defaults change nothing.
-    CHECK(default_ess_start(VC) == 9);
+    // The stock map's ESS is in game 9 to 26, since VC can't reach 8, at stick distances 11 to 34.
+    // The defaults, start 10 and range 25, end at 34 too and start one distance sooner.
     CHECK(stock_ess_start(VC) == ESS_DEFAULT_START && stock_ess_end(VC) == ESS_DEFAULT_END);
-    CHECK(physical_start(VC, default_ess_start(VC)) == ESS_DEFAULT_START);
+    CHECK(physical_start(VC, 9) == ESS_DEFAULT_START);
     CHECK(physical_end(VC, ESS_IN_GAME_END) == ESS_DEFAULT_END);
     CHECK(physical_start(VC, 9) == physical_start(VC, 8));  // 8 is unreachable, so 8 and 9 start together
-    CHECK(max_in_game_end(VC) == 45 && max_in_game_end(SOH) == 45);  // as on ElectroModder's adapter
+    CHECK(ESS_START_DEFAULT == ESS_DEFAULT_START - 1 && ess_end(ESS_START_DEFAULT, ESS_RANGE_DEFAULT) == ESS_DEFAULT_END);
 
     // Software dead zone: nothing that would read 2 or less gets through, 3 and up is untouched.
     const int dead_zone = physical_dead_zone(VC, 2);
@@ -403,9 +402,9 @@ static void test_soh() {
     CHECK(n64(-75, 75) == std::make_pair(-70, 70));
     CHECK(n64(-40, 20) == std::make_pair(-n64(40, -20).first, -n64(40, -20).second));
 
-    // On SoH, 8 can be reached, so the default range starts there and changes nothing.
-    CHECK(default_ess_start(SOH) == OOT_ESS_START);
+    // SoH can reach 8, so the default range, 10 to 34, is exactly the stock map's.
     CHECK(physical_start(SOH, OOT_ESS_START) == stock_ess_start(SOH));
+    CHECK(stock_ess_start(SOH) == ESS_START_DEFAULT && stock_ess_end(SOH) == ess_end(ESS_START_DEFAULT, ESS_RANGE_DEFAULT));
     CHECK(physical_end(SOH, ESS_IN_GAME_END) == stock_ess_end(SOH));
     CHECK(physical_start(SOH, 9) > physical_start(SOH, 8));
 
@@ -462,7 +461,7 @@ static void test_ess_range(Game game) {
     // A range of in-game a to b means: ESS starts where the stock map first reads a or more and
     // ends where it last reads b or less. In-game 0-7 is dead zone, 8-26 is ESS (OoT libu64/pad.c,
     // z_player.c). The expected distances come straight from the stock map.
-    const int ranges[][2] = {{1, 20}, {5, 26}, {8, 26}, {9, 26}, {7, 32}, {8, 35}, {15, 45}, {20, max_in_game_end(game)}};
+    const int ranges[][2] = {{1, 20}, {5, 26}, {8, 26}, {9, 26}, {7, 32}, {8, 35}, {15, 45}, {20, 45}};
     for (const auto& range : ranges) {
         int first = -1, last = -1;
         for (int d = 0; d <= ESS_MAX_END; ++d) {
@@ -561,6 +560,43 @@ static void test_ess_range(Game game) {
                         range.second, diagonal, expected);
         }
         CHECK(same_shape);
+    }
+
+    // Range 0 leaves no ESS anywhere on the stick. Range 1 puts ESS only at the start distance on a
+    // cardinal, and still leaves some ESS in every direction.
+    for (const int start : {1, 5, ESS_START_DEFAULT, 20}) {
+        bool no_ess = true;
+        for (int x = -105; x <= 105; ++x) {
+            for (int y = -105; y <= 105; ++y) {
+                int game_pair[2];
+                pipeline(x, y, start, ess_end(start, 0), 0, game_pair);
+                no_ess = no_ess && oot_zone(game_pair[0], game_pair[1]) != OotZone::Ess;
+            }
+        }
+        bool single = true;
+        for (int direction = 0; direction < 4; ++direction) {
+            for (int d = 0; d <= 105; ++d) {
+                const int value = in_game(game, d, start, ess_end(start, 1), direction);
+                single = single && (value >= 8 && value <= 26) == (d == start);
+            }
+        }
+        bool everywhere = true;
+        for (int a = 0; a < 360; a += 5) {
+            const double angle = a * std::atan(1.0) / 45;
+            bool found = false;
+            for (int d = 1; d <= 60 && !found; ++d) {
+                int game_pair[2];
+                pipeline(static_cast<int>(std::lround(d * std::cos(angle))),
+                         static_cast<int>(std::lround(d * std::sin(angle))), start, ess_end(start, 1), 0, game_pair);
+                found = oot_zone(game_pair[0], game_pair[1]) == OotZone::Ess;
+            }
+            everywhere = everywhere && found;
+        }
+        if (!no_ess || !single || !everywhere) {
+            std::printf("%s: ESS start %d: range 0 %s, range 1 %s on cardinals, %s all around\n", game_name, start,
+                        no_ess ? "ok" : "has ESS", single ? "ok" : "wrong", everywhere ? "ESS" : "no ESS");
+        }
+        CHECK(no_ess && single && everywhere);
     }
 
     bool resting_ok = true;
@@ -767,7 +803,7 @@ static void test_axes_monotonic(Game game) {
     // snapping alone breaks it through VC's length limit, and big offsets in hundreds of places.
     const NotchCalibration turned = turned_notches(5, 0.95);
     StickSettings defaults = stock_settings(game);
-    defaults.dead_zone_distance = physical_dead_zone(game, DEAD_ZONE_DEFAULT);
+    defaults.dead_zone_distance = DEAD_ZONE_DEFAULT;
     StickSettings wide = defaults;
     wide.range_end = physical_end(game, 40);
     StickSettings low_start = defaults;
@@ -808,6 +844,13 @@ static void test_axes_monotonic(Game game) {
     full_speed_soonest.full_speed_start = min_full_speed_start(full_speed_soonest.range_end);
     StickSettings full_speed_latest = defaults;
     full_speed_latest.full_speed_start = MAX_FULL_SPEED_START;
+    // No ESS at all, a single distance of it, and the widest and furthest out the settings go.
+    auto range = [&](int start, int width) {
+        StickSettings s = defaults;
+        s.range_start = start;
+        s.range_end = ess_end(start, width);
+        return s;
+    };
 
     const struct {
         const char* name;
@@ -824,6 +867,10 @@ static void test_axes_monotonic(Game game) {
                  {"boxed in", boxed_in, boxed_in_settings},
                  {"ESS range 9 to 40, soonest full speed", NotchCalibration{}, full_speed_soonest},
                  {"latest full speed", NotchCalibration{}, full_speed_latest},
+                 {"ESS start 10, range 0", NotchCalibration{}, range(10, 0)},
+                 {"ESS start 10, range 1", NotchCalibration{}, range(10, 1)},
+                 {"ESS start 50, range 45", NotchCalibration{}, range(ESS_MAX_START, ESS_MAX_RANGE)},
+                 {"ESS start 1, range 0, turned notches", turned, range(1, 0)},
                  {"latest full speed, big offsets, snap 5", offsets, [&] {
                       StickSettings s = snapping;
                       s.full_speed_start = MAX_FULL_SPEED_START;
@@ -865,10 +912,9 @@ static void test_axes_monotonic(Game game) {
         StickSettings settings = stock_settings(game);
         settings.ess = random(0, 3) > 0;
         settings.snap_distance = random(0, MAX_SNAP_DISTANCE);
-        const int start = random(1, 15), end = random(start + 1, std::min(start + 45, max_in_game_end(game)));
-        settings.range_start = physical_start(game, start);
-        settings.range_end = std::max(physical_end(game, end), settings.range_start + 1);
-        settings.dead_zone_distance = physical_dead_zone(game, random(0, start - 1));
+        settings.range_start = random(1, 20);
+        settings.range_end = ess_end(settings.range_start, random(0, ESS_MAX_RANGE));
+        settings.dead_zone_distance = random(0, settings.range_start);
         settings.full_speed_start = random(0, 2) == 0 ? AUTO_FULL_SPEED : random(min_full_speed_start(settings.range_end), MAX_FULL_SPEED_START);
         const std::string name = "random case " + std::to_string(n);
         CHECK(monotonic_breaks(name.c_str(), cal, settings) == 0);
@@ -903,7 +949,7 @@ static void test_full_speed(Game game) {
     const char* game_name = game == Game::SoH ? "SoH" : "VC";
     CHECK(stock_full_speed_start(game) == (game == Game::SoH ? 86 : 87));
     CHECK(std::lround(auto_full_speed_start(game, stock_ess_end(game))) == stock_full_speed_start(game));
-    for (const int end : {stock_ess_end(game), physical_end(game, 40), physical_end(game, max_in_game_end(game))}) {
+    for (const int end : {stock_ess_end(game), physical_end(game, 40), physical_end(game, 45)}) {
         for (const int full_speed : {min_full_speed_start(end), 70, 81, 90, MAX_FULL_SPEED_START}) {
             if (full_speed < min_full_speed_start(end)) {
                 continue;

@@ -52,9 +52,9 @@ Click Edit settings to open the settings window. While it's open, the game gets 
 ![Settings window](docs/images/settings-window.png)
 
 - **ESS:** one checkbox per port. Leave it checked for OoT on VC. Unchecked sends your stick to the game unchanged.
-- **ESS range:** where ESS starts and ends, in in-game values. The default, 9 to 26, feels like a normal ESS adapter. Lower the start or raise the end for a wider ESS range (the end goes up to 45). Default puts both back.
-- **Full speed from:** how far you push the stick before Link runs at full speed, in game. Lower it to reach full speed sooner, which also makes walking and running take less of the stick. Normally it's set for you ("auto") and changes with the ESS range. Clicking - or + sets your own, and Default goes back to auto.
-- **Software dead zone:** makes a stick that rests slightly off center read exactly 0, 0 in game. You'd only notice the difference in tools like gz. Default is 2, 0 turns it off.
+- **ESS start, range:** how far you push the stick before ESS starts, and how much of the stick ESS takes up. Start 10, range 25 is the default. Range goes up to 45, and 0 means no ESS at all. Default puts both back.
+- **Full speed from:** how far you push the stick before Link runs at full speed, in stick units. Lower it to reach full speed sooner, which also makes walking and running take less of the stick. Normally it's set for you ("auto") and changes with the ESS range. Clicking - or + sets your own, and Default goes back to auto.
+- **Software dead zone:** makes a stick that rests slightly off center read exactly 0, 0 in game. You'd only notice the difference in tools like gz. Default is 5. 0 turns it off, and it can't go past the ESS start.
 - **Notch snapping:** see Notch calibration. Off by default.
 
 The two plots show where your stick is, one dot per controller. The colors show what Link does there. Green is ESS: hold the stick in the green to turn in place. "Your stick" is your stick, and "In game" is what the game gets.

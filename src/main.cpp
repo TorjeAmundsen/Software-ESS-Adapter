@@ -83,10 +83,9 @@ enum ControlId {
     ID_RANGE_START_MINUS,
     ID_RANGE_START_VALUE,
     ID_RANGE_START_PLUS,
-    ID_RANGE_END_LABEL,
-    ID_RANGE_END_MINUS,
-    ID_RANGE_END_VALUE,
-    ID_RANGE_END_PLUS,
+    ID_RANGE_WIDTH_MINUS,
+    ID_RANGE_WIDTH_VALUE,
+    ID_RANGE_WIDTH_PLUS,
     ID_RANGE_DEFAULT,
     ID_EDIT,
     ID_MAIN_HINT,
@@ -201,17 +200,18 @@ static std::atomic<Game> g_game{Game::WiiVC};
 static constexpr int MAX_INPUT_LAG_MS = 100;
 static std::atomic<int> g_input_lag{0};
 static std::atomic<int> g_snap_distance{DEFAULT_SNAP_DISTANCE};
-// ESS range as the user sets it, in in-game units, and the physical stick distances that
-// gives (see ess_range.hpp). The distances are recomputed whenever the setting changes.
-static std::atomic<int> g_range_start{default_ess_start(Game::WiiVC)};
-static std::atomic<int> g_range_end{ESS_IN_GAME_END};
+// The ESS range as the user sets it, a start and a range in stick units. g_range_distances holds the start and end distances that gives, recomputed whenever a
+// setting changes. See ess_range.hpp.
+static std::atomic<int> g_range_start{ESS_START_DEFAULT};
+static std::atomic<int> g_range_width{ESS_RANGE_DEFAULT};
 // Start and end distances packed into one atomic, so the bridge thread never reads a new start
 // with an old end.
 struct RangeDistances {
     int start;
     int end;
 };
-static std::atomic<uint32_t> g_range_distances{static_cast<uint32_t>(ESS_DEFAULT_START) << 16 | ESS_DEFAULT_END};
+static std::atomic<uint32_t> g_range_distances{static_cast<uint32_t>(ESS_START_DEFAULT) << 16 |
+                                                ess_end(ESS_START_DEFAULT, ESS_RANGE_DEFAULT)};
 
 static RangeDistances range_distances() {
     const uint32_t packed = g_range_distances;
@@ -219,47 +219,25 @@ static RangeDistances range_distances() {
 }
 
 static void update_range_distances() {
-    const int start = physical_start(g_game, g_range_start);
-    const int end = std::max(physical_end(g_game, g_range_end), start + 1);
+    const int start = g_range_start, end = ess_end(start, g_range_width);
     g_range_distances = static_cast<uint32_t>(start) << 16 | static_cast<uint32_t>(end);
 }
 
-// Where full speed starts as the user sets it, in in-game units like the ESS range, or AUTO_FULL_SPEED,
-// and the physical distance that gives (see ess_range.hpp), recomputed whenever a setting changes.
+// Where full speed starts as the user sets it, a stick distance or AUTO_FULL_SPEED. See
+// ess_range.hpp.
 static std::atomic<int> g_full_speed{AUTO_FULL_SPEED};
-static std::atomic<int> g_full_speed_distance{AUTO_FULL_SPEED};
 
-// The next in-game value the stock map makes on a cardinal, up to MAX_FULL_SPEED_START, going up
-// (step 1) or down (step -1) from `value`. Past 60 the Wii VC skips values (60, then 63), and
-// stepping onto one it can't make would change nothing.
-static int next_in_game(int value, int step) {
-    int next = value;
-    for (int d = 0; d <= MAX_FULL_SPEED_START; ++d) {
-        const int v = stock_in_game(g_game, d);
-        if (step > 0 && v > value) {
-            return v;
-        }
-        if (step < 0 && v < value) {
-            next = v;
-        }
-    }
-    return next;
-}
-
-// The in-game values a full speed setting may take with the current ESS range: the lowest one that
-// starts at least min_full_speed_start past the end, and the one at MAX_FULL_SPEED_START.
+// The distances a full speed setting may take with the current ESS range.
 static int lowest_full_speed() {
-    const int distance = min_full_speed_start(range_distances().end);
-    const int value = stock_in_game(g_game, distance);
-    return physical_start(g_game, value) >= distance ? value : next_in_game(value, 1);
+    return min_full_speed_start(range_distances().end);
 }
 static int highest_full_speed() {
-    return stock_in_game(g_game, MAX_FULL_SPEED_START);
+    return MAX_FULL_SPEED_START;
 }
 
-// What automatic gives, in in-game units, as the settings window shows it.
+// What automatic gives, as the settings window shows it.
 static int auto_full_speed() {
-    return stock_in_game(g_game, static_cast<int>(std::lround(auto_full_speed_start(g_game, range_distances().end))));
+    return static_cast<int>(std::lround(auto_full_speed_start(g_game, range_distances().end)));
 }
 
 // The full speed value the settings window shows: the set one, or what automatic gives.
@@ -268,9 +246,8 @@ static int shown_full_speed() {
     return full_speed == AUTO_FULL_SPEED ? auto_full_speed() : full_speed;
 }
 
-// Software dead zone, in in-game units, and the physical distance it covers.
+// Software dead zone, a stick distance. See ess_range.hpp.
 static std::atomic<int> g_dead_zone{DEAD_ZONE_DEFAULT};
-static std::atomic<int> g_dead_zone_distance{0};
 // Calibration state. Only the bridge thread changes these; the UI asks for a change through
 // g_calibration_request (a port to start, or -1 to stop), so a button press and a click can't
 // interleave.
@@ -361,10 +338,15 @@ static const char* const SETTINGS_SECTION = "Settings";
 static const char* const KEY_GAME = "Game";  // 0 = Wii VC, 1 = Ship of Harkinian
 static const char* const KEY_INPUT_LAG = "InputLagMs";
 static const char* const KEY_SNAP_DISTANCE = "SnapDistance";
-static const char* const KEY_RANGE_START = "EssStartInGame";
-static const char* const KEY_RANGE_END = "EssEndInGame";
-static const char* const KEY_DEAD_ZONE = "DeadZoneInGame";
-static const char* const KEY_FULL_SPEED = "FullSpeedInGame";  // -1 = automatic
+static const char* const KEY_RANGE_START = "EssStart";
+static const char* const KEY_RANGE_WIDTH = "EssRange";
+static const char* const KEY_DEAD_ZONE = "DeadZone";
+static const char* const KEY_FULL_SPEED = "FullSpeedStart";  // -1 = automatic
+// Older versions stored the same settings in game units under these keys.
+static const char* const KEY_OLD_RANGE_START = "EssStartInGame";
+static const char* const KEY_OLD_RANGE_END = "EssEndInGame";
+static const char* const KEY_OLD_DEAD_ZONE = "DeadZoneInGame";
+static const char* const KEY_OLD_FULL_SPEED = "FullSpeedInGame";
 static const char* const KEY_ESS = "Ess";                 // per port
 static const char* const KEY_NEUTRAL = "NeutralSamples";  // per port
 static const char* const KEY_NOTCHES = "Notches";         // per port
@@ -375,17 +357,13 @@ static const char* const KEY_NOTCH_OFFSETS = "NotchOffsets";  // per port
 static void apply_settings() {
     g_snap_distance = std::clamp<int>(g_snap_distance, 0, MAX_SNAP_DISTANCE);
     g_input_lag = std::clamp<int>(g_input_lag, 0, MAX_INPUT_LAG_MS);
-    g_range_end = std::clamp<int>(g_range_end, 2, max_in_game_end(g_game));
-    g_range_start = std::clamp<int>(g_range_start, 1, g_range_end - 1);
-    g_dead_zone = std::clamp<int>(g_dead_zone, 0, g_range_start - 1);
+    g_range_start = std::clamp<int>(g_range_start, 1, ESS_MAX_START);
+    g_range_width = std::clamp<int>(g_range_width, 0, ESS_MAX_RANGE);
+    g_dead_zone = std::clamp<int>(g_dead_zone, 0, g_range_start);
     update_range_distances();
     if (g_full_speed != AUTO_FULL_SPEED) {
-        // A value the stock map makes, so the window shows what the game gets there.
         g_full_speed = std::clamp<int>(g_full_speed, lowest_full_speed(), highest_full_speed());
-        g_full_speed = stock_in_game(g_game, physical_start(g_game, g_full_speed));
     }
-    g_full_speed_distance = g_full_speed == AUTO_FULL_SPEED ? AUTO_FULL_SPEED : physical_start(g_game, g_full_speed);
-    g_dead_zone_distance = physical_dead_zone(g_game, g_dead_zone);
 }
 
 static void save_settings() {
@@ -399,9 +377,12 @@ static void save_settings() {
     }
     write(KEY_SNAP_DISTANCE, g_snap_distance);
     write(KEY_RANGE_START, g_range_start);
-    write(KEY_RANGE_END, g_range_end);
+    write(KEY_RANGE_WIDTH, g_range_width);
     write(KEY_DEAD_ZONE, g_dead_zone);
     write(KEY_FULL_SPEED, g_full_speed);
+    for (const char* key : {KEY_OLD_RANGE_START, KEY_OLD_RANGE_END, KEY_OLD_DEAD_ZONE, KEY_OLD_FULL_SPEED}) {
+        ini_write(path, SETTINGS_SECTION, key, std::nullopt);
+    }
 }
 
 static void load_settings() {
@@ -413,10 +394,23 @@ static void load_settings() {
     g_game = SOH_FEATURES && read(KEY_GAME, 0) == 1 ? Game::SoH : Game::WiiVC;
     g_input_lag = SOH_FEATURES ? read(KEY_INPUT_LAG, 0) : 0;
     g_snap_distance = read(KEY_SNAP_DISTANCE, DEFAULT_SNAP_DISTANCE);
-    g_range_start = read(KEY_RANGE_START, default_ess_start(g_game));
-    g_range_end = read(KEY_RANGE_END, ESS_IN_GAME_END);
-    g_dead_zone = read(KEY_DEAD_ZONE, DEAD_ZONE_DEFAULT);
-    g_full_speed = read(KEY_FULL_SPEED, AUTO_FULL_SPEED);
+    constexpr int MISSING = -2;
+    if (read(KEY_RANGE_START, MISSING) == MISSING && read(KEY_OLD_RANGE_START, MISSING) != MISSING) {
+        // An older version's settings in game units. Turn them into the stick distances that give
+        // the same zones.
+        const int start = physical_start(g_game, read(KEY_OLD_RANGE_START, 0));
+        const int end = std::max(physical_end(g_game, read(KEY_OLD_RANGE_END, ESS_IN_GAME_END)), start + 1);
+        const int full_speed = read(KEY_OLD_FULL_SPEED, AUTO_FULL_SPEED);
+        g_range_start = start;
+        g_range_width = end - start + 1;
+        g_dead_zone = physical_dead_zone(g_game, read(KEY_OLD_DEAD_ZONE, 0));
+        g_full_speed = full_speed < 0 ? AUTO_FULL_SPEED : physical_start(g_game, full_speed);
+    } else {
+        g_range_start = read(KEY_RANGE_START, ESS_START_DEFAULT);
+        g_range_width = read(KEY_RANGE_WIDTH, ESS_RANGE_DEFAULT);
+        g_dead_zone = read(KEY_DEAD_ZONE, DEAD_ZONE_DEFAULT);
+        g_full_speed = read(KEY_FULL_SPEED, AUTO_FULL_SPEED);
+    }
     if (g_full_speed < 0) {
         g_full_speed = AUTO_FULL_SPEED;  // anything else below 0, from a hand-edited file
     }
@@ -497,7 +491,7 @@ static const char* limit_reason(int id) {
         }
         return nullptr;
     }
-    const int snap = g_snap_distance, start = g_range_start, end = g_range_end, dead_zone = g_dead_zone, lag = g_input_lag;
+    const int snap = g_snap_distance, start = g_range_start, width = g_range_width, dead_zone = g_dead_zone, lag = g_input_lag;
     switch (id) {
     case ID_LAG_MINUS:
     case ID_LAG_PLUS:
@@ -521,19 +515,22 @@ static const char* limit_reason(int id) {
         }
         return nullptr;
     case ID_RANGE_START_MINUS:
-        if (start > dead_zone + 1) {
-            return nullptr;
+        if (start == 1) {
+            return "The ESS start can't go any lower.";
         }
-        return dead_zone > 0 ? "The ESS range start must stay above the software dead zone. Lower the dead zone first."
-                             : "The ESS range start can't go any lower.";
+        return start == dead_zone ? "The ESS start can't go below the software dead zone. Lower the dead zone first." : nullptr;
     case ID_RANGE_START_PLUS:
-        return start == end - 1 ? "The ESS range start must stay below the end." : nullptr;
-    case ID_RANGE_END_MINUS:
-        return end == start + 1 ? "The ESS range end must stay above the start." : nullptr;
-    case ID_RANGE_END_PLUS:
-        if (end == max_in_game_end(g_game)) {
+        if (start == ESS_MAX_START) {
+            static const std::string reason = "The ESS start goes up to " + std::to_string(ESS_MAX_START) + ".";
+            return reason.c_str();
+        }
+        return nullptr;
+    case ID_RANGE_WIDTH_MINUS:
+        return width == 0 ? "The ESS range is already 0, no ESS at all." : nullptr;
+    case ID_RANGE_WIDTH_PLUS:
+        if (width == ESS_MAX_RANGE) {
             static const std::string reason =
-                "The ESS range end goes up to " + std::to_string(ESS_IN_GAME_MAX_END) + ", as on ElectroModder's adapter.";
+                "The ESS range goes up to " + std::to_string(ESS_MAX_RANGE) + ".";
             return reason.c_str();
         }
         return nullptr;
@@ -547,7 +544,7 @@ static const char* limit_reason(int id) {
     case ID_DEAD_ZONE_MINUS:
         return dead_zone == 0 ? "The software dead zone is already off." : nullptr;
     case ID_DEAD_ZONE_PLUS:
-        return dead_zone == start - 1 ? "The software dead zone must stay below the ESS range start. Raise the start first." : nullptr;
+        return dead_zone == start ? "The software dead zone can't go past the ESS start. Raise the start first." : nullptr;
     }
     return nullptr;
 }
@@ -560,7 +557,7 @@ struct Stepper {
 };
 static const Stepper STEPPERS[] = {{ID_SNAP_MINUS, ID_SNAP_PLUS, &g_snap_distance},
                                    {ID_RANGE_START_MINUS, ID_RANGE_START_PLUS, &g_range_start},
-                                   {ID_RANGE_END_MINUS, ID_RANGE_END_PLUS, &g_range_end},
+                                   {ID_RANGE_WIDTH_MINUS, ID_RANGE_WIDTH_PLUS, &g_range_width},
                                    {ID_FULL_SPEED_MINUS, ID_FULL_SPEED_PLUS, &g_full_speed},
                                    {ID_DEAD_ZONE_MINUS, ID_DEAD_ZONE_PLUS, &g_dead_zone},
                                    {ID_LAG_MINUS, ID_LAG_PLUS, &g_input_lag}};
@@ -642,8 +639,8 @@ static StickSettings stick_settings(int port) {
     settings.snap_distance = g_snap_distance;
     settings.range_start = range.start;
     settings.range_end = range.end;
-    settings.full_speed_start = g_full_speed_distance;
-    settings.dead_zone_distance = g_dead_zone_distance;
+    settings.full_speed_start = g_full_speed;
+    settings.dead_zone_distance = g_dead_zone;
     return settings;
 }
 
@@ -1234,10 +1231,10 @@ static void refresh_settings(DarkWindow* window) {
 
     set_text(window, ID_SNAP_VALUE, std::to_string(g_snap_distance));
     set_text(window, ID_RANGE_START_VALUE, std::to_string(g_range_start));
-    set_text(window, ID_RANGE_END_VALUE, std::to_string(g_range_end));
+    set_text(window, ID_RANGE_WIDTH_VALUE, std::to_string(g_range_width));
     set_text(window, ID_DEAD_ZONE_VALUE, std::to_string(g_dead_zone));
     set_text(window, ID_FULL_SPEED_VALUE, std::to_string(shown_full_speed()));
-    set_text(window, ID_FULL_SPEED_HINT, g_full_speed == AUTO_FULL_SPEED ? "in game, auto" : "in game");
+    set_text(window, ID_FULL_SPEED_HINT, g_full_speed == AUTO_FULL_SPEED ? "stick units, auto" : "stick units");
     set_text(window, ID_LAG_VALUE, std::to_string(g_input_lag));
     // Repaint a -/+ button when it reaches or leaves its limit (it looks dimmed there).
     static bool shown_at_limit[std::size(STEPPERS) * 2] = {};
@@ -1546,9 +1543,8 @@ static void on_settings_command(DarkWindow* window, int id) {
     for (const Stepper& stepper : STEPPERS) {
         if (id == stepper.minus || id == stepper.plus) {
             if (stepper.value == &g_full_speed) {
-                // From the value it shows, to the next one the game gets. Back on automatic's value,
-                // it's automatic again.
-                const int value = next_in_game(shown_full_speed(), id == stepper.plus ? 1 : -1);
+                // Step from the value it shows. Landing on automatic's value makes it automatic again.
+                const int value = shown_full_speed() + (id == stepper.plus ? 1 : -1);
                 g_full_speed = value == auto_full_speed() ? AUTO_FULL_SPEED : value;
             } else {
                 *stepper.value += id == stepper.plus ? 1 : -1;
@@ -1595,8 +1591,8 @@ static void on_settings_command(DarkWindow* window, int id) {
         redraw_control(window, ID_GAME_VC);
         redraw_control(window, ID_GAME_SOH);
     } else if (id == ID_RANGE_DEFAULT) {
-        g_range_start = default_ess_start(g_game);
-        g_range_end = ESS_IN_GAME_END;
+        g_range_start = ESS_START_DEFAULT;
+        g_range_width = ESS_RANGE_DEFAULT;
         g_dead_zone = DEAD_ZONE_DEFAULT;
         g_full_speed = AUTO_FULL_SPEED;
         apply_settings();
@@ -1644,12 +1640,11 @@ static void open_settings() {
         stepper(control_x, 134, ID_SNAP_MINUS, ID_SNAP_VALUE, ID_SNAP_PLUS);
         add_dim_text(window, "stick units, 0 = off", hint_x, 137, 115, 18, ID_SNAP_HINT);
 
-        add_text(window, "ESS range", label_x, 167, 130, 18, ID_RANGE_LABEL);
+        add_text(window, "ESS start, range", label_x, 167, 130, 18, ID_RANGE_LABEL);
         stepper(control_x, 164, ID_RANGE_START_MINUS, ID_RANGE_START_VALUE, ID_RANGE_START_PLUS);
-        add_text(window, "to", control_x + 86, 167, 22, 18, ID_RANGE_END_LABEL, true);
-        stepper(control_x + 112, 164, ID_RANGE_END_MINUS, ID_RANGE_END_VALUE, ID_RANGE_END_PLUS);
+        stepper(control_x + 112, 164, ID_RANGE_WIDTH_MINUS, ID_RANGE_WIDTH_VALUE, ID_RANGE_WIDTH_PLUS);
         add_button(window, "Default", control_x + 204, 164, 62, 22, ID_RANGE_DEFAULT);
-        add_dim_text(window, "in game", hint_x, 167, 115, 18, ID_RANGE_HINT);
+        add_dim_text(window, "stick units", hint_x, 167, 115, 18, ID_RANGE_HINT);
 
         add_text(window, "Full speed from", label_x, 197, 130, 18, ID_FULL_SPEED_LABEL);
         stepper(control_x, 194, ID_FULL_SPEED_MINUS, ID_FULL_SPEED_VALUE, ID_FULL_SPEED_PLUS);
@@ -1657,7 +1652,7 @@ static void open_settings() {
 
         add_text(window, "Software dead zone", label_x, 227, 130, 18, ID_DEAD_ZONE_LABEL);
         stepper(control_x, 224, ID_DEAD_ZONE_MINUS, ID_DEAD_ZONE_VALUE, ID_DEAD_ZONE_PLUS);
-        add_dim_text(window, "in game, 0 = off", hint_x, 227, 115, 18, ID_DEAD_ZONE_HINT);
+        add_dim_text(window, "stick units, 0 = off", hint_x, 227, 115, 18, ID_DEAD_ZONE_HINT);
 
         if (SOH_FEATURES) {
             add_text(window, "Playing on", label_x, 257, 130, 18, ID_GAME_LABEL);

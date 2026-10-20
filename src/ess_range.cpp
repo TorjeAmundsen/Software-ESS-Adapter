@@ -115,10 +115,6 @@ int physical_end(Game game, int in_game) {
     return last;
 }
 
-int default_ess_start(Game game) {
-    return stock_in_game(game, physical_start(game, OOT_ESS_START));
-}
-
 int stock_ess_start(Game game) {
     static const int start[2] = {physical_start(Game::WiiVC, OOT_ESS_START), physical_start(Game::SoH, OOT_ESS_START)};
     return start[game == Game::SoH];
@@ -151,10 +147,6 @@ double auto_full_speed_start(Game game, int end) {
 
 int min_full_speed_start(int end) {
     return end + MIN_FULL_SPEED_GAP;
-}
-
-int max_in_game_end(Game game) {
-    return std::min(stock_in_game(game, ESS_MAX_END), ESS_IN_GAME_MAX_END);
 }
 
 int physical_dead_zone(Game game, int in_game) {
@@ -325,11 +317,21 @@ void remap_ess_range(Game game, uint8_t stick[2], int start, int end, int full_s
     const double start_scale = here.start / cardinal.start, end_scale = here.end / cardinal.end;
     const double S = stock_ess_start(game) * start_scale, E = stock_ess_end(game) * end_scale;
     const double range_start = start * start_scale;
-    const double range_end = std::min(end * end_scale, FULL_TILT - 1);
+    // The two scales differ, so in this direction a range of 0 or 1 could gain or lose ESS. With no
+    // ESS, the end sits a unit before the start, as on a cardinal. Otherwise it never comes before
+    // the start.
+    const double range_end = end < start ? range_start - 1 : std::min(std::max(end * end_scale, range_start), FULL_TILT - 1);
+    // On the diagonals the stock map's ESS starts further out but ends about as far, so a range of
+    // a unit or two can get thinner than the gap between stick positions and lose all of them.
+    // With range 1 on the Wii VC, 156 of 360 degrees had no ESS. A ring that narrow becomes the
+    // band a cardinal has, half a unit either side of its distances, and all of it goes to the
+    // middle of ESS. Only the direction matters in ESS.
+    const bool narrow = end >= start && range_end - range_start < 2;
+    const double ess_from = narrow ? range_start - 0.5 : range_start;
 
     // Piecewise linear: [0, start] -> [0, S], [start, end] -> [S, E], [end, 105] -> [E, 105].
     double out[2];
-    if (r < range_start) {
+    if (r < ess_from) {
         // The same scale in every direction, so the software dead zone (a square) keeps its shape.
         // Each axis stays just under the cardinal anchor, the edge of the game's dead zone (also a
         // square), so nothing below start rounds up into the range.
@@ -350,8 +352,9 @@ void remap_ess_range(Game game, uint8_t stick[2], int start, int end, int full_s
                                      ? FULL_TILT
                                      : std::clamp((full_speed - 0.5) * F / stock_run_edges(game, 1, 0).full, range_end + 2, FULL_TILT - 1);
         const double run_edge = range_end + (R - E) * (full_edge - range_end) / (F - E);
-        if (r <= range_end) {
-            mapped = S + (r - range_start) * (E - S) / (range_end - range_start);
+        const bool in_ess = narrow ? r < range_start + (end - start) + 0.5 : r <= range_end;
+        if (in_ess) {
+            mapped = narrow ? (S + E) / 2 : S + (r - range_start) * (E - S) / (range_end - range_start);
         } else if (full_speed == AUTO_FULL_SPEED) {
             // Stay at or over the value that rounds up past E, so nothing above end enters the range.
             mapped = std::max(E + (r - range_end) * (FULL_TILT - E) / (FULL_TILT - range_end), E + 0.5);
@@ -363,7 +366,7 @@ void remap_ess_range(Game game, uint8_t stick[2], int start, int end, int full_s
         out[0] = x * mapped / r;
         out[1] = y * mapped / r;
 
-        if (full_speed != AUTO_FULL_SPEED && r > range_end) {
+        if (full_speed != AUTO_FULL_SPEED && !in_ess) {
             // A set full speed distance stretches or squeezes the stock map past the end, so plain rounding
             // would scatter the stock map's rounded running and full speed edges into
             // noise. Instead, the zone here is the stock map's own, moved along the ray by as much
