@@ -31,6 +31,7 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #include <SDL3/SDL.h>
@@ -1126,21 +1127,30 @@ static SDL_JoystickID attach_pad(const char* name, Uint16 product) {
     return SDL_AttachVirtualJoystick(&desc);
 }
 
-static void test_gamepad_ports() {
-    // Only the virtual controllers below: real ones would take ports first.
+// Opens `pads` with only SDL's virtual controllers: real ones would take ports first. False, after
+// saying so, if a real controller shows up anyway.
+static bool open_virtual_only(Gamepads& pads, const char* test) {
     for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_XINPUT_ENABLED, SDL_HINT_JOYSTICK_WGI,
                              SDL_HINT_JOYSTICK_DIRECTINPUT, SDL_HINT_JOYSTICK_GAMEINPUT}) {
         SDL_SetHint(hint, "0");
     }
-    Gamepads pads;
     CHECK(pads.open());
     AdapterFrame frame;
     pads.read(frame);
     if (!pads.connected().empty()) {
-        std::printf("gamepad ports: skipped, unplug the controllers to run it\n");
+        std::printf("%s: skipped, unplug the controllers to run it\n", test);
         pads.close();
+        return false;
+    }
+    return true;
+}
+
+static void test_gamepad_ports() {
+    Gamepads pads;
+    if (!open_virtual_only(pads, "gamepad ports")) {
         return;
     }
+    AdapterFrame frame;
     auto port_of = [&](SDL_JoystickID id) {
         pads.read(frame);
         for (const GamepadInfo& info : pads.connected()) {
@@ -1308,6 +1318,65 @@ static void test_calibration_section() {
     CHECK(calibration_section({"0300abcd", "x]y\nz", "Pad"}) == "Controller 0300abcd xyz");
 }
 
+// Every button, trigger and stick a controller has, one at a time, lands on the Gamecube's and
+// nowhere else: buttons by position (bottom A, right B, left X, top Y), the right shoulder as Z, the
+// triggers as L and R, analog and clicked at the bottom.
+static void test_gamepad_buttons() {
+    Gamepads pads;
+    if (!open_virtual_only(pads, "gamepad buttons")) {
+        return;
+    }
+    const SDL_JoystickID id = attach_pad("Pad", 1);
+    SDL_Joystick* joystick = SDL_OpenJoystick(id);
+    AdapterFrame frame;
+    pads.read(frame);
+    CHECK(frame[0].connected);
+
+    const struct {
+        SDL_GamepadButton button;
+        uint8_t buttons1, buttons2;
+    } buttons[] = {{SDL_GAMEPAD_BUTTON_SOUTH, 0x01, 0},      {SDL_GAMEPAD_BUTTON_EAST, 0x02, 0},
+                   {SDL_GAMEPAD_BUTTON_WEST, 0x04, 0},       {SDL_GAMEPAD_BUTTON_NORTH, 0x08, 0},
+                   {SDL_GAMEPAD_BUTTON_DPAD_LEFT, 0x10, 0},  {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 0x20, 0},
+                   {SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0x40, 0},  {SDL_GAMEPAD_BUTTON_DPAD_UP, 0x80, 0},
+                   {SDL_GAMEPAD_BUTTON_START, 0, 0x01},      {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 0, 0x02},
+                   {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0, 0}, {SDL_GAMEPAD_BUTTON_BACK, 0, 0},
+                   {SDL_GAMEPAD_BUTTON_LEFT_STICK, 0, 0}};
+    for (const auto& b : buttons) {
+        SDL_SetJoystickVirtualButton(joystick, b.button, true);
+        pads.read(frame);
+        if (frame[0].buttons1 != b.buttons1 || frame[0].buttons2 != b.buttons2) {
+            std::printf("SDL button %d reads %02x %02x\n", b.button, frame[0].buttons1, frame[0].buttons2);
+        }
+        CHECK(frame[0].buttons1 == b.buttons1 && frame[0].buttons2 == b.buttons2);
+        SDL_SetJoystickVirtualButton(joystick, b.button, false);
+    }
+
+    // A virtual trigger's axis rests at the bottom of its range, so 0 is about halfway down.
+    for (const auto& [axis, side, click] : {std::tuple(SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 0, 0x08), std::tuple(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 1, 0x04)}) {
+        pads.read(frame);
+        CHECK(frame[0].trigger[0] == 0 && frame[0].trigger[1] == 0 && frame[0].buttons2 == 0);
+        SDL_SetJoystickVirtualAxis(joystick, axis, 0);
+        pads.read(frame);
+        CHECK(std::abs(frame[0].trigger[side] - 128) <= 1 && frame[0].trigger[1 - side] == 0 && frame[0].buttons2 == 0);
+        SDL_SetJoystickVirtualAxis(joystick, axis, SDL_JOYSTICK_AXIS_MAX);
+        pads.read(frame);
+        CHECK(frame[0].trigger[side] == 255 && frame[0].trigger[1 - side] == 0 && frame[0].buttons2 == click);
+        SDL_SetJoystickVirtualAxis(joystick, axis, SDL_JOYSTICK_AXIS_MIN);
+    }
+
+    // The right stick is the C-stick, up as up. The main stick stays put.
+    SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_RIGHTX, SDL_JOYSTICK_AXIS_MAX);
+    SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_RIGHTY, -SDL_JOYSTICK_AXIS_MAX);
+    pads.read(frame);
+    CHECK(frame[0].cstick[0] == 128 + GATE_STRAIGHT && frame[0].cstick[1] == 128 + GATE_STRAIGHT);
+    CHECK(frame[0].stick[0] == 128 && frame[0].stick[1] == 128);
+
+    SDL_CloseJoystick(joystick);
+    SDL_DetachVirtualJoystick(id);
+    pads.close();
+}
+
 int main() {
 #ifdef _WIN32
     WSADATA wsa;
@@ -1331,6 +1400,7 @@ int main() {
     test_delayed_sender();
     test_gamepad_conversion();
     test_gamepad_ports();
+    test_gamepad_buttons();
     test_port_centering();
     test_calibration_press();
     test_calibration_section();
