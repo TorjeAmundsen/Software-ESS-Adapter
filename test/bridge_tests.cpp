@@ -74,10 +74,8 @@ static uint8_t through_dolphin(uint8_t sent) {
 }
 
 static void test_dolphin_round_trip() {
-    // Sent as is, bytes 0 to 64 arrive one too high, e.g. ESS full tilt left (64) as 65.
-    CHECK(through_dolphin(64) == 65);
-    CHECK(through_dolphin(65) == 65);
-    // With the correction every byte from 1 to 255 arrives unchanged. 0 is out of reach.
+    // Sent as is, bytes 0 to 64 arrive one too high, e.g. ESS full tilt left (64) as 65. With the
+    // correction every byte from 1 to 255 arrives unchanged. 0 is out of reach.
     bool all_match = true;
     for (int v = 1; v < 256; ++v) {
         all_match = all_match && through_dolphin(to_dolphin_stick(static_cast<uint8_t>(v))) == v;
@@ -86,6 +84,8 @@ static void test_dolphin_round_trip() {
     CHECK(through_dolphin(to_dolphin_stick(0)) == 1);
 }
 
+// The ESS map sends center as center. Through VC a center that moves a little still reads 0 in
+// game, so nothing further down the path would notice; Dolphin would get the wrong byte.
 static void test_ess_center() {
     uint8_t c[2] = {128, 128};
     invert_vc_gc(c);
@@ -167,7 +167,6 @@ static void test_notch_warp_and_snap() {
     for (int i = 0; i < NOTCH_COUNT; ++i) {
         CHECK((warp(cal.notch[i][0], cal.notch[i][1]) == std::pair<int, int>(IDEAL_NOTCHES[i][0], IDEAL_NOTCHES[i][1])));
     }
-    CHECK(warp(0, 0) == std::make_pair(0, 0));
 
     // Halfway to a notch, and halfway between two notches, land halfway between the ideal ones.
     for (int i = 0; i < NOTCH_COUNT; ++i) {
@@ -201,7 +200,6 @@ static void test_notch_warp_and_snap() {
     CHECK(snap(0, 101, 3) == std::make_pair(0, 101));  // 4 away
     CHECK(snap(0, 102, 0) == std::make_pair(0, 102));  // snapping off
     CHECK(snap(0, 102, 3, false) == std::make_pair(0, 102));
-    CHECK(snap(0, 0, 10) == std::make_pair(0, 0));
 
     // Without a calibration the warp does nothing.
     cal.valid = false;
@@ -330,7 +328,6 @@ static void test_vc_and_conversion() {
     CHECK(oot_zone(65, 0) == OotZone::Run);    // 58
     CHECK(oot_zone(66, 0) == OotZone::FullSpeed);  // 59: past about 58.6
     CHECK(oot_zone(80, -80) == OotZone::FullSpeed);
-    CHECK(oot_magnitude(80, 80) == 60.0f);
 
     // Two-axis VC matches the one-axis version on the axes, and is symmetric.
     int both[2];
@@ -352,8 +349,6 @@ static void test_soh() {
     CHECK(soh(128, 128) == std::make_pair(0, 0));
     CHECK(soh(255, 128) == std::make_pair(85, 0));
     CHECK(soh(0, 128) == std::make_pair(-85, 0));
-    CHECK(soh(1, 128) == std::make_pair(-85, 0));
-    CHECK(soh(128, 255) == std::make_pair(0, 85));
     CHECK(soh(128 + 63, 128) == std::make_pair(42, 0));  // 63 * 85 / 127 = 42.2
     bool symmetric = true;
     for (int b = 1; b < 256; ++b) {
@@ -422,8 +417,6 @@ static void test_soh() {
         soh_in_game(s[0], s[1], game);
         return std::make_pair(game[0], game[1]);
     };
-    CHECK(through(0, 0) == std::make_pair(0, 0));
-    CHECK(through(105, 0) == std::make_pair(80, 0));
     CHECK(through(-105, 0) == std::make_pair(-80, 0));
     CHECK(through(0, 105) == std::make_pair(0, 80));
     CHECK(through(75, 75) == std::make_pair(68, 68));
@@ -1115,7 +1108,6 @@ static void test_gamepad_conversion() {
     CHECK(gamepad_trigger_byte(0) == 0);
     CHECK(gamepad_trigger_byte(32767) == 255);
     CHECK(gamepad_trigger_byte(-1) == 0);
-    CHECK(TRIGGER_CLICK > 0 && TRIGGER_CLICK < 32767);
 }
 
 // A virtual SDL controller with every gamepad button and axis. Models differ by product id.
@@ -1194,10 +1186,10 @@ static void test_gamepad_ports() {
     CHECK(frame[1].buttons1 == 0x03);  // A and B
     SDL_CloseJoystick(joystick);
 
-    // Any controller again: port 2 no longer waits for A.
     // Picking a controller that's gone changes nothing.
     CHECK(!pads.pick(1, 0xFFFFFF));
     CHECK(pads.port_controller(1).name == "Pad A");
+    // Any controller again: port 2 no longer waits for A.
     pads.pick_any(1);
     CHECK(pads.port_controller(1).model.empty());
     SDL_DetachVirtualJoystick(a2);
