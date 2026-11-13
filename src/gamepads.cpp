@@ -124,6 +124,30 @@ void Gamepads::fill_free_ports() {
     }
 }
 
+// What's printed on a face button, or where it is if SDL doesn't know.
+static std::string button_label(SDL_Gamepad* pad, SDL_GamepadButton button, const char* position) {
+    switch (SDL_GetGamepadButtonLabel(pad, button)) {
+    case SDL_GAMEPAD_BUTTON_LABEL_A:
+        return "A";
+    case SDL_GAMEPAD_BUTTON_LABEL_B:
+        return "B";
+    case SDL_GAMEPAD_BUTTON_LABEL_X:
+        return "X";
+    case SDL_GAMEPAD_BUTTON_LABEL_Y:
+        return "Y";
+    case SDL_GAMEPAD_BUTTON_LABEL_CROSS:
+        return "Cross";
+    case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE:
+        return "Circle";
+    case SDL_GAMEPAD_BUTTON_LABEL_SQUARE:
+        return "Square";
+    case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE:
+        return "Triangle";
+    default:
+        return position;
+    }
+}
+
 void Gamepads::add(uint32_t id) {
     SDL_Gamepad* handle = SDL_OpenGamepad(id);
     if (!handle) {
@@ -141,7 +165,9 @@ void Gamepads::add(uint32_t id) {
     char model[33];
     SDL_GUIDToString(guid, model, sizeof(model));
     std::lock_guard lock(mutex_);
-    pads_.push_back({handle, id, name, no_guid ? "name:" + name : std::string(model), serial ? serial : "", -1});
+    pads_.push_back({handle, id, name, no_guid ? "name:" + name : std::string(model), serial ? serial : "", -1,
+                     button_label(handle, SDL_GAMEPAD_BUTTON_SOUTH, "the bottom button"),
+                     button_label(handle, SDL_GAMEPAD_BUTTON_EAST, "the right button")});
     place(pads_.back());
 }
 
@@ -190,7 +216,7 @@ std::vector<GamepadInfo> Gamepads::connected() const {
     std::lock_guard lock(mutex_);
     std::vector<GamepadInfo> list;
     for (const Pad& pad : pads_) {
-        list.push_back({pad.id, pad.name, pad.port});
+        list.push_back({pad.id, pad.name, pad.port, pad.a_label, pad.b_label});
     }
     return list;
 }

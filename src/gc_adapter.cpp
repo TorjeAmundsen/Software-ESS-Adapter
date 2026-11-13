@@ -44,7 +44,7 @@ bool GCAdapter::open() {
 
     if (!device) {
         libusb_free_device_list(list, 1);
-        error_ = "Adapter not found. Check that its USB cable is plugged in.";
+        error_ = "Adapter not found. Check that its USB cable is plugged in, or choose Other controllers in Edit settings.";
         return false;
     }
 

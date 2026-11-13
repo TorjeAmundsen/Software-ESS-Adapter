@@ -1114,12 +1114,13 @@ static void test_gamepad_conversion() {
     CHECK(gamepad_trigger_byte(-1) == 0);
 }
 
-// A virtual SDL controller with every gamepad button and axis. Models differ by product id.
-static SDL_JoystickID attach_pad(const char* name, Uint16 product) {
+// A virtual SDL controller with every gamepad button and axis. Models differ by product id; SDL
+// tells Nintendo's and Sony's controllers by vendor and product id.
+static SDL_JoystickID attach_pad(const char* name, Uint16 product, Uint16 vendor = 0x1234) {
     SDL_VirtualJoystickDesc desc;
     SDL_INIT_INTERFACE(&desc);
     desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
-    desc.vendor_id = 0x1234;
+    desc.vendor_id = vendor;
     desc.product_id = product;
     desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
     desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
@@ -1374,6 +1375,25 @@ static void test_gamepad_buttons() {
 
     SDL_CloseJoystick(joystick);
     SDL_DetachVirtualJoystick(id);
+
+    // Calibration prompts name A and B the way the controller labels them. A is the bottom button,
+    // which a Switch Pro labels B, and a DualSense Cross.
+    auto labels = [&](Uint16 vendor, Uint16 product) {
+        const SDL_JoystickID pad = attach_pad("Labelled", product, vendor);
+        pads.read(frame);
+        std::pair<std::string, std::string> result;
+        for (const GamepadInfo& info : pads.connected()) {
+            if (info.id == pad) {
+                result = {info.a_label, info.b_label};
+            }
+        }
+        SDL_DetachVirtualJoystick(pad);
+        pads.read(frame);
+        return result;
+    };
+    CHECK(labels(0x1234, 1) == std::make_pair(std::string("A"), std::string("B")));
+    CHECK(labels(0x057e, 0x2009) == std::make_pair(std::string("B"), std::string("A")));  // Switch Pro
+    CHECK(labels(0x054c, 0x0ce6) == std::make_pair(std::string("Cross"), std::string("Circle")));  // DualSense
     pads.close();
 }
 

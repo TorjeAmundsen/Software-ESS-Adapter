@@ -37,6 +37,9 @@ struct GamepadInfo {
     uint32_t id;  // SDL's id for it, while it stays connected
     std::string name;
     int port;  // -1 when it has none: every port is taken or waiting for its own controller
+    // What the controller calls its bottom and right face buttons (A and B here), such as Cross
+    // and Circle, or B and A on Nintendo's layout, for prompts.
+    std::string a_label, b_label;
 };
 
 // A controller as the settings file remembers it: the one a port keeps (no model means any
@@ -86,6 +89,7 @@ private:
         uint32_t id;
         std::string name, model, serial;
         int port;
+        std::string a_label, b_label;
     };
     Pad* in_port(int port);
     void place(Pad& pad);

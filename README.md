@@ -1,12 +1,14 @@
 # Software ESS Adapter
 
-Play Ocarina of Time (Wii VC) in Dolphin with N64-like stick feel, using your Gamecube controller and the official Gamecube controller adapter. No extra hardware needed. Runs on Windows and Linux.
+Play Ocarina of Time (Wii VC) in Dolphin with N64-like stick feel, using your Gamecube controller and the official Gamecube controller adapter, or an Xbox, PlayStation, Switch Pro or most other controllers. No extra hardware needed. Runs on Windows and Linux.
 
 ![Main window](docs/images/main-window.png)
 
 How it works and how to build it is in [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Setup
+
+With a controller other than a Gamecube controller, skip step 1, and see Other controllers below for step 2.
 
 1. If your adapter has a mode switch, set it to Wii U/Switch mode, not PC mode. If Dolphin has already worked with your adapter in this mode, using "GameCube Adapter for Wii U" as the controller type, skip to step 2. Otherwise:
    - **Windows:** set up the adapter driver as the [Dolphin guide](https://dolphin-emu.org/docs/guides/how-use-official-gc-controller-adapter-wii-u/) describes.
@@ -33,13 +35,13 @@ That's it. Keep Software ESS Adapter open while you play.
 
 ### Other controllers
 
-Software ESS Adapter can also read Xbox, PlayStation, Switch Pro and most other controllers instead of the adapter. In the settings window, set Controllers to Other controllers, and skip step 1 above. The program lets go of the adapter, and reads the other controllers in its place.
+Software ESS Adapter can also read Xbox, PlayStation, Switch Pro and most other controllers instead of the adapter. At step 2, without an adapter, the top line says "Adapter not found". Click Edit settings, set Controllers to Other controllers, and close the settings window. The top line then says "Controllers connected", or "No controllers found" until you plug one in. The program lets go of the adapter, and reads the other controllers in its place. Then carry on with step 3.
 
 Each port in the settings window has a menu to pick its controller. A port keeps the controller you pick, even after a restart, and waits for it while it's unplugged. Picking a controller that's on another port swaps the two ports. Ports set to Any controller (the default) take the other controllers, in the order you plug them in. The program tells controllers apart by serial number. Some controllers don't report one, so two of the same model may swap ports after a restart.
 
 Buttons go by position: the bottom face button is A and the right one is B, as in OoT's button display and on the Gamecube and N64 controllers. Left is X and top is Y. The right shoulder button is Z, and the triggers are L and R. To use a different layout, remap the buttons in Dolphin.
 
-Full tilt straight ahead reads 105, the same as a perfect Gamecube notch. A perfectly round stick's diagonals read 74, 74, where a Gamecube's read 75, 75. Real sticks are rarely that round. Notch calibration (below) fixes both: hold the stick all the way in each direction as you calibrate.
+Full tilt straight ahead reads 105, the same as a perfect Gamecube notch. A perfectly round stick's diagonals read 74, 74, where a Gamecube's read 75, 75. Real sticks are rarely that round. Notch calibration (below) fixes both: hold the stick all the way in each direction as you calibrate. The calibration prompts name your controller's own buttons: A is the bottom button, so on a PlayStation controller they say Cross and Circle, and on a Switch Pro controller B and A.
 
 ## The main window
 

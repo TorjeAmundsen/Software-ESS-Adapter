@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -665,6 +666,23 @@ static const char* client_name() {
     return g_game == Game::SoH ? "Ship of Harkinian" : "Dolphin";
 }
 
+// The buttons that record a calibration step (A) and cancel it (B), as the controller on the port
+// names them: other controllers go by position, so on a Switch Pro A is the button printed B, and
+// on a PlayStation controller it's Cross.
+struct CalibrationButtons {
+    std::string a, b;
+};
+static CalibrationButtons calibration_buttons(int port) {
+    if (g_source == Source::Gamepads) {
+        for (const GamepadInfo& pad : g_gamepads.connected()) {
+            if (pad.port == port) {
+                return {pad.a_label, pad.b_label};
+            }
+        }
+    }
+    return {"A", "B"};
+}
+
 // The input lag to add right now: only on Ship of Harkinian.
 static std::chrono::microseconds input_lag() {
     return std::chrono::milliseconds(g_game == Game::SoH ? g_input_lag.load() : 0);
@@ -823,8 +841,9 @@ static void bridge_loop() {
             if (p == g_calibrating_port) {
                 const CalibrationResult result = calibration_press(progress, raw[p].stick, port_origin.stick, a && !prev_a[p], b && !prev_b[p]);
                 g_calibration_step = progress.step;
-                auto ask_again = [](int i) {
-                    set_notice(std::string("That's not the ") + NOTCH_NAMES[i] + " notch. Hold it and press A again.");
+                auto ask_again = [p](int i) {
+                    set_notice(std::string("That's not the ") + NOTCH_NAMES[i] + " notch. Hold it and press " + calibration_buttons(p).a +
+                               " again.");
                 };
                 if (result.event == CalibrationEvent::Cancelled) {
                     g_calibrating_port = -1;
@@ -1263,14 +1282,31 @@ public:
         return 0;
     }
 
+    // Shows the port's controller: a name, and a state after it such as " (unplugged)", which stays
+    // whole when a long name has to be shortened. Dim when no controller is there.
+    void show_choice(const std::string& name, const std::string& state, bool dim) {
+        if (name != name_ || state != state_ || dim != dim_) {
+            name_ = name;
+            state_ = state;
+            dim_ = dim;
+            redraw();
+        }
+    }
+
     void draw() override {
         const Rect rect = {x(), y(), x() + w(), y() + h()};
         fill(rect, COLOR_FACE);
         frame(rect, COLOR_BORDER);
         fl_font(labelfont(), labelsize());
-        fl_color(COLOR_TEXT);
-        fl_push_clip(rect.left + 6, rect.top, w() - 24, h());
-        draw_text_in(label() ? label() : "", {rect.left + 6, rect.top, rect.right - 18, rect.bottom}, false);
+        fl_color(dim_ ? COLOR_DIM_TEXT : COLOR_TEXT);
+        const int room = w() - 24;
+        std::string text = name_ + state_;
+        for (std::string name = name_; fl_width(text.c_str()) > room && !name.empty();) {
+            name.pop_back();
+            text = name + "..." + state_;
+        }
+        fl_push_clip(rect.left + 6, rect.top, room, h());
+        draw_text_in(text, {rect.left + 6, rect.top, rect.right - 18, rect.bottom}, false);
         fl_pop_clip();
         const int cx = rect.right - 11, cy = (rect.top + rect.bottom) / 2;
         fl_polygon(cx - 4, cy - 2, cx + 4, cy - 2, cx, cy + 2);
@@ -1314,6 +1350,8 @@ private:
     }
 
     int port_;
+    std::string name_, state_;
+    bool dim_ = false;
 };
 
 static Text* add_text(DarkWindow* window, const char* text, int x, int y, int w, int h, int id, bool centered = false) {
@@ -1430,7 +1468,14 @@ static void refresh_settings(DarkWindow* window) {
                 return info.port == p;
             });
             const PortController kept = g_gamepads.port_controller(p);
-            set_text(window, ID_PORT_PICK + p, pad != pads.end() ? pad->name : !kept.model.empty() ? kept.name + " (unplugged)" : "No controller");
+            auto* dropdown = static_cast<Dropdown*>(window->control(ID_PORT_PICK + p));
+            if (pad != pads.end()) {
+                dropdown->show_choice(pad->name, "", false);
+            } else if (!kept.model.empty()) {
+                dropdown->show_choice(kept.name, " (unplugged)", true);
+            } else {
+                dropdown->show_choice("No controller", "", true);
+            }
         } else {
             set_text(window, ID_PORT_TEXT + p, raw[p].connected ? "Controller connected" : "No controller");
         }
@@ -1478,15 +1523,18 @@ static void refresh_settings(DarkWindow* window) {
     if (calibrating >= 0) {
         const std::string port = std::to_string(calibrating + 1);
         const int step = g_calibration_step;
-        const std::string progress = " (" + std::to_string(step + 1) + "/" + std::to_string(CALIBRATION_STEPS) + "). B cancels.";
+        const CalibrationButtons buttons = calibration_buttons(calibrating);
+        std::string cancel = buttons.b;
+        cancel[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cancel[0])));  // starts a sentence
+        const std::string progress = " (" + std::to_string(step + 1) + "/" + std::to_string(CALIBRATION_STEPS) + "). " + cancel + " cancels.";
         if (!notice.empty()) {
             prompt = "Port " + port + ": " + notice;
         } else if (!raw[calibrating].connected) {
             prompt = "Port " + port + " calibration: plug in a controller.";
         } else if (is_neutral_step(step)) {
-            prompt = "Port " + port + ": let go of the stick, press A" + progress;
+            prompt = "Port " + port + ": let go of the stick, press " + buttons.a + progress;
         } else {
-            prompt = "Port " + port + ": hold the " + NOTCH_NAMES[notch_of_step(step)] + " notch, press A" + progress;
+            prompt = "Port " + port + ": hold the " + NOTCH_NAMES[notch_of_step(step)] + " notch, press " + buttons.a + progress;
         }
     }
     set_text(window, ID_PROMPT, prompt);
