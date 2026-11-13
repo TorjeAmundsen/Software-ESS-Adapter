@@ -49,12 +49,12 @@
 #include "delayed_sender.hpp"
 #include "dsu_server.hpp"
 #include "embedded.hpp"
-#include "ess.hpp"
 #include "ess_range.hpp"
 #include "gamepads.hpp"
 #include "gc_adapter.hpp"
 #include "ini.hpp"
 #include "notch.hpp"
+#include "port.hpp"
 #include "resource.h"
 #include "stick.hpp"
 
@@ -406,25 +406,6 @@ static void save_settings() {
     }
 }
 
-// Where a notch calibration and its offsets are saved. Through the adapter they belong to the port,
-// as before other controllers existed: a Gamecube controller can't be told apart from another.
-// Other controllers' follow the controller to any port, a section per model and serial number,
-// so identical controllers without a serial share one. A calibration through the adapter doesn't
-// fit another controller, and the other way around, so the two never share a section.
-static std::string calibration_section(const PortController& controller) {
-    std::string section = "Controller " + controller.model;
-    if (!controller.serial.empty()) {
-        section += " " + controller.serial;
-    }
-    // ] would end the section name early.
-    section.erase(std::remove_if(section.begin(), section.end(),
-                                 [](char c) {
-                                     return c == ']' || static_cast<unsigned char>(c) < ' ';
-                                 }),
-                  section.end());
-    return section;
-}
-
 // The notch calibration and offsets saved in a section.
 static NotchCalibration load_notches(const std::string& path, const std::string& section) {
     // NeutralSamples = the 8 raw x,y pairs recorded at rest. Notches = x,y pairs in
@@ -719,28 +700,14 @@ static StickSettings stick_settings(int port) {
     return settings;
 }
 
-static GCPortState center(const GCPortState& raw, const GCPortState& origin) {
-    // Dolphin's emulated pad always reports a centered origin, so center
-    // everything here the way the game would against the real origin.
-    GCPortState out = raw;
-    uint8_t stick_origin[2] = {origin.stick[0], origin.stick[1]};
-    normalize_origin(out.stick, stick_origin);
-    uint8_t cstick_origin[2] = {origin.cstick[0], origin.cstick[1]};
-    normalize_origin(out.cstick, cstick_origin);
-    for (int i = 0; i < 2; ++i) {
-        out.trigger[i] = raw.trigger[i] > origin.trigger[i] ? raw.trigger[i] - origin.trigger[i] : 0;
-    }
-    return out;
-}
-
 static void bridge_loop() {
     GCAdapter adapter;
     InputSource* source = nullptr;  // the one g_source picks
-    AdapterFrame raw{}, centered{}, calibrated{}, out{}, sent{}, origin{};
-    bool has_origin[PORT_COUNT] = {};
+    AdapterFrame raw{}, centered{}, calibrated{}, out{}, sent{};
+    PortCentering centering[PORT_COUNT];
     std::array<uint32_t, PORT_COUNT> port_ids{};  // with other controllers, the controller behind each port
     bool prev_a[PORT_COUNT] = {}, prev_b[PORT_COUNT] = {};
-    uint8_t samples[CALIBRATION_STEPS][2] = {};  // raw stick per calibration step
+    CalibrationProgress progress;  // of the port calibrating; g_calibration_step mirrors its step for the windows
     // Everything goes out through here, so input lag delays it all, disconnects included.
     DelayedSender sender([](const AdapterFrame& frame, Game game) { g_dsu.publish(frame, game); });
 
@@ -748,6 +715,7 @@ static void bridge_loop() {
     auto take_calibration_request = [&] {
         const int request = g_calibration_request.exchange(NO_REQUEST);
         if (request != NO_REQUEST) {
+            progress.step = 0;
             g_calibration_step = 0;
             g_calibrating_port = request;
             if (request >= 0) {
@@ -767,7 +735,9 @@ static void bridge_loop() {
     // and the windows stop showing stale controllers and stick positions.
     auto forget_controllers = [&] {
         raw = {};
-        std::fill(std::begin(has_origin), std::end(has_origin), false);
+        for (PortCentering& port : centering) {
+            port.reset();
+        }
         sender.push(AdapterFrame{}, g_game, input_lag());  // reports every port as disconnected
         std::lock_guard lock(g_mutex);
         g_raw = g_centered = g_calibrated = g_out = AdapterFrame{};
@@ -829,8 +799,9 @@ static void bridge_loop() {
                 const std::optional<PortController> controller = id ? g_gamepads.controller(id) : std::nullopt;
                 const std::string section = controller ? calibration_section(*controller) : std::string();
                 use_section(p, section);
-                has_origin[p] = false;
+                centering[p].reset();
                 if (p == g_calibrating_port) {
+                    progress.step = 0;
                     g_calibration_step = 0;
                     calibrating_section = section;
                 }
@@ -844,72 +815,43 @@ static void bridge_loop() {
             std::copy(std::begin(g_notches), std::end(g_notches), notches);
         }
         for (int p = 0; p < PORT_COUNT; ++p) {
-            // Like Dolphin and the console: the first report after plugging in is the origin.
-            if (raw[p].connected && !has_origin[p]) {
-                origin[p] = raw[p];
-            }
-            has_origin[p] = raw[p].connected;
-            // With calibrated notches, the main stick is centered on the saved neutral instead.
-            GCPortState port_origin = origin[p];
-            if (notches[p].valid) {
-                port_origin.stick[0] = notches[p].neutral[0];
-                port_origin.stick[1] = notches[p].neutral[1];
-            }
-            centered[p] = center(raw[p], port_origin);
-            // Anywhere the stick was seen resting during calibration counts as exactly neutral.
-            if (in_neutral_range(notches[p], raw[p].stick)) {
-                centered[p].stick[0] = 128;
-                centered[p].stick[1] = 128;
-            }
+            GCPortState port_origin;
+            centered[p] = centering[p].center(raw[p], notches[p], &port_origin);
             const bool a = raw[p].buttons1 & 0x01;
             const bool b = raw[p].buttons1 & 0x02;
 
             if (p == g_calibrating_port) {
-                // A records the current notch, B cancels.
-                if (b && !prev_b[p]) {
+                const CalibrationResult result = calibration_press(progress, raw[p].stick, port_origin.stick, a && !prev_a[p], b && !prev_b[p]);
+                g_calibration_step = progress.step;
+                auto ask_again = [](int i) {
+                    set_notice(std::string("That's not the ") + NOTCH_NAMES[i] + " notch. Hold it and press A again.");
+                };
+                if (result.event == CalibrationEvent::Cancelled) {
                     g_calibrating_port = -1;
                     set_notice("Port " + std::to_string(p + 1) + " calibration cancelled.");
-                } else if (a && !prev_a[p]) {
-                    const int step = g_calibration_step;
-                    const int notch = notch_of_step(step);
-                    auto ask_again = [](int i) {
-                        set_notice(std::string("That's not the ") + NOTCH_NAMES[i] + " notch. Hold it and press A again.");
-                    };
-                    // Neutral isn't known yet, so check against the current center. The finished
-                    // calibration is checked again against the real neutral below.
-                    const int x = raw[p].stick[0] - port_origin.stick[0];
-                    const int y = raw[p].stick[1] - port_origin.stick[1];
-                    samples[step][0] = raw[p].stick[0];
-                    samples[step][1] = raw[p].stick[1];
-                    if (!is_neutral_step(step) && !notch_in_section(notch, x, y)) {
-                        ask_again(notch);
-                    } else if (step + 1 < CALIBRATION_STEPS) {
-                        g_calibration_step = step + 1;
-                    } else if (const NotchCalibration calibration = make_calibration(samples); misplaced_notch(calibration) >= 0) {
-                        const int misplaced = misplaced_notch(calibration);
-                        g_calibration_step = 2 * misplaced;
-                        ask_again(misplaced);
-                    } else {
-                        bool kept = false;
-                        {
-                            // Only if the port still saves where the calibration started. After
-                            // switching source the frame may still be the old source's: then it
-                            // belongs to the old source, and goes nowhere.
-                            std::lock_guard lock(g_mutex);
-                            if (!calibrating_section.empty() && g_sections[p] == calibrating_section) {
-                                // Calibrating again keeps the notch offsets.
-                                NotchCalibration with_offsets = calibration;
-                                std::copy(&g_notches[p].offset[0][0], &g_notches[p].offset[0][0] + NOTCH_COUNT * 2,
-                                          &with_offsets.offset[0][0]);
-                                g_notches[p] = with_offsets;
-                                kept = true;
-                            }
+                } else if (result.event == CalibrationEvent::WrongNotch || result.event == CalibrationEvent::Misplaced) {
+                    ask_again(result.notch);
+                } else if (result.event == CalibrationEvent::Finished) {
+                    const NotchCalibration& calibration = result.calibration;
+                    bool kept = false;
+                    {
+                        // Only if the port still saves where the calibration started. After
+                        // switching source the frame may still be the old source's: then it
+                        // belongs to the old source, and goes nowhere.
+                        std::lock_guard lock(g_mutex);
+                        if (!calibrating_section.empty() && g_sections[p] == calibrating_section) {
+                            // Calibrating again keeps the notch offsets.
+                            NotchCalibration with_offsets = calibration;
+                            std::copy(&g_notches[p].offset[0][0], &g_notches[p].offset[0][0] + NOTCH_COUNT * 2,
+                                      &with_offsets.offset[0][0]);
+                            g_notches[p] = with_offsets;
+                            kept = true;
                         }
-                        g_calibrating_port = -1;
-                        if (kept) {
-                            save_notches(calibrating_section, calibration);
-                            set_notice("Port " + std::to_string(p + 1) + " notches calibrated and saved.");
-                        }
+                    }
+                    g_calibrating_port = -1;
+                    if (kept) {
+                        save_notches(calibrating_section, calibration);
+                        set_notice("Port " + std::to_string(p + 1) + " notches calibrated and saved.");
                     }
                 }
             }

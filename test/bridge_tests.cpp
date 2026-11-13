@@ -9,6 +9,8 @@
 // 3. Talks to DsuServer like Dolphin does and checks the pad data that comes back.
 // 4. Checks how other controllers' sticks and triggers turn into Gamecube bytes, and which port
 //    each one gets, with SDL's virtual controllers.
+// 5. Checks what the bridge loop does per port before the stick path: centering on the origin,
+//    and notch calibration press by press.
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -40,6 +42,7 @@
 #include "gamepads.hpp"
 #include "ini.hpp"
 #include "notch.hpp"
+#include "port.hpp"
 #include "soh.hpp"
 #include "stick.hpp"
 
@@ -1202,6 +1205,109 @@ static void test_gamepad_ports() {
     pads.close();
 }
 
+static void test_port_centering() {
+    auto report = [](int x, int y, int trigger) {
+        GCPortState s;
+        s.connected = true;
+        s.stick[0] = static_cast<uint8_t>(x);
+        s.stick[1] = static_cast<uint8_t>(y);
+        s.cstick[0] = static_cast<uint8_t>(x - 10);
+        s.cstick[1] = static_cast<uint8_t>(y + 6);
+        s.trigger[0] = s.trigger[1] = static_cast<uint8_t>(trigger);
+        return s;
+    };
+    PortCentering port;
+    const NotchCalibration none;
+
+    // The first report is the origin: everything reads centered, triggers released.
+    GCPortState c = port.center(report(130, 125, 20), none);
+    CHECK(c.stick[0] == 128 && c.stick[1] == 128 && c.cstick[0] == 128 && c.cstick[1] == 128);
+    CHECK(c.trigger[0] == 0 && c.trigger[1] == 0);
+    // Later reports are relative to it. A trigger resting below its origin reads 0.
+    c = port.center(report(140, 120, 50), none);
+    CHECK(c.stick[0] == 138 && c.stick[1] == 123 && c.cstick[0] == 138 && c.cstick[1] == 123);
+    CHECK(c.trigger[0] == 30);
+    CHECK(port.center(report(130, 125, 10), none).trigger[0] == 0);
+
+    // Unplugged and plugged back in, resting somewhere else: that's the new origin.
+    port.center(GCPortState{}, none);
+    c = port.center(report(110, 140, 0), none);
+    CHECK(c.stick[0] == 128 && c.stick[1] == 128);
+    // Another controller taking over the port without it reading as unplugged.
+    port.reset();
+    c = port.center(report(150, 100, 0), none);
+    CHECK(c.stick[0] == 128 && c.stick[1] == 128);
+    CHECK(port.center(report(160, 100, 0), none).stick[0] == 138);
+
+    // With calibrated notches the main stick centers on the saved neutral, not the origin, and the
+    // C-stick still on the origin. Anywhere neutral was seen reads exactly 128, 128.
+    NotchCalibration cal;
+    cal.valid = true;
+    const uint8_t samples[NOTCH_COUNT][2] = {{120, 130}, {121, 130}, {119, 131}, {120, 129},
+                                             {120, 130}, {121, 131}, {119, 129}, {120, 130}};
+    set_neutral_samples(cal, samples);
+    GCPortState origin;
+    c = port.center(report(125, 130, 0), cal, &origin);
+    CHECK(origin.stick[0] == 120 && origin.stick[1] == 130);
+    CHECK(c.stick[0] == 133 && c.stick[1] == 128);
+    CHECK(c.cstick[0] == 103 && c.cstick[1] == 158);  // 115,136 against the origin's 140,106
+    c = port.center(report(121, 131, 0), cal);
+    CHECK(c.stick[0] == 128 && c.stick[1] == 128);  // in the neutral range, though not its average
+}
+
+static void test_calibration_press() {
+    const uint8_t origin[2] = {128, 128};
+    auto press = [&](CalibrationProgress& progress, int x, int y) {
+        const uint8_t stick[2] = {static_cast<uint8_t>(x), static_cast<uint8_t>(y)};
+        return calibration_press(progress, stick, origin, true, false).event;
+    };
+    // Each notch at 90% of the ideal one, neutral at rest, with neutral at `rest_x`.
+    auto run = [&](CalibrationProgress& progress, int rest_x) {
+        CalibrationResult result;
+        for (int step = 0; step < CALIBRATION_STEPS; ++step) {
+            const int notch = notch_of_step(step);
+            const uint8_t stick[2] = {
+                static_cast<uint8_t>(is_neutral_step(step) ? rest_x : 128 + IDEAL_NOTCHES[notch][0] * 9 / 10),
+                static_cast<uint8_t>(is_neutral_step(step) ? 128 : 128 + IDEAL_NOTCHES[notch][1] * 9 / 10)};
+            result = calibration_press(progress, stick, origin, true, false);
+            if (step + 1 < CALIBRATION_STEPS && result.event != CalibrationEvent::NextStep) {
+                return result;
+            }
+        }
+        return result;
+    };
+
+    CalibrationProgress progress;
+    const CalibrationResult done = run(progress, 128);
+    CHECK(done.event == CalibrationEvent::Finished && done.calibration.valid);
+    CHECK(done.calibration.notch[0][0] == 0 && done.calibration.notch[0][1] == 94);
+
+    // Nothing pressed, nothing happens. B cancels, even with A.
+    progress = CalibrationProgress{};
+    const uint8_t up[2] = {128, 128 + 94};
+    CHECK(calibration_press(progress, up, origin, false, false).event == CalibrationEvent::NoPress);
+    CHECK(calibration_press(progress, up, origin, true, true).event == CalibrationEvent::Cancelled);
+    CHECK(progress.step == 0);
+
+    // A outside the notch the step asks for asks again, on the same step.
+    CHECK(press(progress, 128 + 94, 128) == CalibrationEvent::WrongNotch);
+    CHECK(progress.step == 0);
+    CHECK(press(progress, 128, 128 + 94) == CalibrationEvent::NextStep && progress.step == 1);
+
+    // Neutral 40 units to the right: every notch passed against the origin, but against the real
+    // neutral Up is 23 degrees off, so the finished calibration sends the user back to Up.
+    progress = CalibrationProgress{};
+    const CalibrationResult misplaced = run(progress, 168);
+    CHECK(misplaced.event == CalibrationEvent::Misplaced && misplaced.notch == 0 && progress.step == 0);
+}
+
+static void test_calibration_section() {
+    CHECK(calibration_section({"0300abcd", "", "Pad"}) == "Controller 0300abcd");
+    CHECK(calibration_section({"0300abcd", "a4:53:85", "Pad"}) == "Controller 0300abcd a4:53:85");
+    // ] would end the section name, and a line break the line.
+    CHECK(calibration_section({"0300abcd", "x]y\nz", "Pad"}) == "Controller 0300abcd xyz");
+}
+
 int main() {
 #ifdef _WIN32
     WSADATA wsa;
@@ -1225,6 +1331,9 @@ int main() {
     test_delayed_sender();
     test_gamepad_conversion();
     test_gamepad_ports();
+    test_port_centering();
+    test_calibration_press();
+    test_calibration_section();
 #ifdef _WIN32
     WSACleanup();
 #endif

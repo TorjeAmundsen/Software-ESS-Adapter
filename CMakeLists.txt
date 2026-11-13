@@ -130,6 +130,7 @@ add_library(bridge_core STATIC
   src/gc_adapter.cpp
   src/ini.cpp
   src/notch.cpp
+  src/port.cpp
   src/soh.cpp
   src/stick.cpp)
 target_include_directories(bridge_core PUBLIC src)
