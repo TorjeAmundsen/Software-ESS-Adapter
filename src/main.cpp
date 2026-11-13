@@ -7,6 +7,7 @@
 
 #include <FL/Fl.H>
 #include <FL/Fl_Double_Window.H>
+#include <FL/Fl_Menu_Button.H>
 #include <FL/Fl_RGB_Image.H>
 #include <FL/fl_ask.H>
 #include <FL/fl_draw.H>
@@ -26,6 +27,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -38,6 +40,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -48,6 +51,7 @@
 #include "embedded.hpp"
 #include "ess.hpp"
 #include "ess_range.hpp"
+#include "gamepads.hpp"
 #include "gc_adapter.hpp"
 #include "ini.hpp"
 #include "notch.hpp"
@@ -125,6 +129,9 @@ enum ControlId {
     ID_FULL_SPEED_VALUE,
     ID_FULL_SPEED_PLUS,
     ID_FULL_SPEED_HINT,
+    ID_SOURCE_LABEL,
+    ID_SOURCE_ADAPTER,  // "Controllers" choices, drawn as a pair of toggle buttons like "Playing on"
+    ID_SOURCE_GAMEPADS,
     ID_ESS_CHECK = 200,
     ID_CALIBRATE = 300,
     ID_PORT_TEXT = 400,
@@ -135,7 +142,8 @@ enum ControlId {
     ID_OFFSET_STEP = 900,    // + 4 * notch + 2 * axis, + 1 for plus
     ID_OFFSET_VALUE = 940,   // + 2 * notch + axis
     ID_OFFSET_NAME = 960,    // + notch, then the X and Y headers
-    ID_OFFSET_GAME = 970     // + notch
+    ID_OFFSET_GAME = 970,    // + notch
+    ID_PORT_PICK = 1000      // per port, picks its controller (other controllers only)
 };
 
 static const Fl_Color COLOR_BG = fl_rgb_color(32, 32, 32);
@@ -181,9 +189,9 @@ static constexpr int PLOT_SCALE = 1;                         // pixels per unit,
 static constexpr int STICK_PLOT_RANGE = 118;                 // stick units from center to edge; fits a ring at 105 + 12
 static constexpr int GAME_PLOT_RANGE = 90;                   // in-game units from center to edge; fits SoH's 85
 static constexpr int N64_STRAIGHT = 80, N64_DIAGONAL = 70;   // the N64 stick range, drawn on the game plot
-static constexpr int LEGEND_WIDTH = 150;                     // beside the game plot: a row per zone
+static constexpr int LEGEND_WIDTH = 160;                     // beside the game plot: a row per zone, then the readouts
 static constexpr int STICK_PLOT_SIZE = 2 * PLOT_SCALE * STICK_PLOT_RANGE, GAME_PLOT_SIZE = 2 * PLOT_SCALE * GAME_PLOT_RANGE;
-static constexpr int PLOTS_TOP = SOH_FEATURES ? 342 : 282;  // under the settings rows (two more in dev builds)
+static constexpr int PLOTS_TOP = SOH_FEATURES ? 372 : 312;  // under the settings rows (two more in dev builds)
 static const Rect STICK_PLOT = {10, PLOTS_TOP, 10 + STICK_PLOT_SIZE, PLOTS_TOP + STICK_PLOT_SIZE};
 static const Rect GAME_PLOT = {STICK_PLOT.right + 10, PLOTS_TOP, STICK_PLOT.right + 10 + GAME_PLOT_SIZE, PLOTS_TOP + GAME_PLOT_SIZE};
 static const int SETTINGS_BOTTOM_Y = STICK_PLOT.bottom + 12;  // the prompt line and Done
@@ -193,9 +201,13 @@ static const char* const WINDOW_CLASS = "SoftwareESSAdapter";
 static const char* const SOURCE_URL = "https://github.com/TorjeAmundsen/Software-ESS-Adapter";
 
 static DsuServer g_dsu;
+static Gamepads g_gamepads;  // other controllers; the bridge thread reads them, the windows pick ports
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_ess[PORT_COUNT] = {true, true, true, true};
 static std::atomic<Game> g_game{Game::WiiVC};
+// Where controllers come from: the Gamecube adapter, or any other controller through SDL.
+enum class Source { Adapter, Gamepads };
+static std::atomic<Source> g_source{Source::Adapter};
 // Input lag added on Ship of Harkinian, in milliseconds (see delayed_sender.hpp).
 static constexpr int MAX_INPUT_LAG_MS = 100;
 static std::atomic<int> g_input_lag{0};
@@ -285,6 +297,9 @@ static std::chrono::steady_clock::time_point g_notice_time;
 static std::string g_offsets_notice;  // the same for the notch offsets window
 static std::chrono::steady_clock::time_point g_offsets_notice_time;
 static NotchCalibration g_notches[PORT_COUNT];
+// The settings file section each port's calibration lives in (see calibration_section), or empty
+// for a port without a controller to calibrate. Only the bridge thread changes it, under g_mutex.
+static std::string g_sections[PORT_COUNT];
 
 // Settings live next to the program: Software ESS Adapter settings.ini on Windows,
 // software-ess-adapter-settings.ini on Linux. The "settings" part keeps it apart from the Dolphin
@@ -318,7 +333,7 @@ static std::string port_section(int port) {
 }
 
 // Reads "a,b,c,..." with exactly `count` integers in [min, max].
-static bool read_ints(const std::string& path, const std::string& section, const char* key, int* values, int count, int min, int max) {
+static bool read_ints(const std::string& path, const std::string& section, const std::string& key, int* values, int count, int min, int max) {
     const std::string text = ini_read(path, section, key).value_or("");
     const char* cursor = text.c_str();
     for (int i = 0; i < count; ++i) {
@@ -336,6 +351,7 @@ static bool read_ints(const std::string& path, const std::string& section, const
 // Settings file keys, named once so loading and saving can't drift apart.
 static const char* const SETTINGS_SECTION = "Settings";
 static const char* const KEY_GAME = "Game";  // 0 = Wii VC, 1 = Ship of Harkinian
+static const char* const KEY_SOURCE = "Controllers";  // 0 = Gamecube adapter, 1 = other controllers
 static const char* const KEY_INPUT_LAG = "InputLagMs";
 static const char* const KEY_SNAP_DISTANCE = "SnapDistance";
 static const char* const KEY_RANGE_START = "EssStart";
@@ -348,9 +364,13 @@ static const char* const KEY_OLD_RANGE_END = "EssEndInGame";
 static const char* const KEY_OLD_DEAD_ZONE = "DeadZoneInGame";
 static const char* const KEY_OLD_FULL_SPEED = "FullSpeedInGame";
 static const char* const KEY_ESS = "Ess";                 // per port
-static const char* const KEY_NEUTRAL = "NeutralSamples";  // per port
-static const char* const KEY_NOTCHES = "Notches";         // per port
-static const char* const KEY_NOTCH_OFFSETS = "NotchOffsets";  // per port
+static const char* const KEY_NEUTRAL = "NeutralSamples";  // per calibration, see calibration_section
+static const char* const KEY_NOTCHES = "Notches";         // per calibration
+static const char* const KEY_NOTCH_OFFSETS = "NotchOffsets";  // per calibration
+// The controller a port keeps, with other controllers (see PortController). Per port.
+static const char* const KEY_CONTROLLER_MODEL = "ControllerModel";
+static const char* const KEY_CONTROLLER_SERIAL = "ControllerSerial";
+static const char* const KEY_CONTROLLER_NAME = "ControllerName";
 
 // The settings rules in one place: keeps every value in its allowed range and updates the
 // distances derived from them. Runs after loading and after every change.
@@ -375,6 +395,7 @@ static void save_settings() {
         write(KEY_GAME, g_game == Game::SoH ? 1 : 0);
         write(KEY_INPUT_LAG, g_input_lag);
     }
+    write(KEY_SOURCE, g_source == Source::Gamepads ? 1 : 0);
     write(KEY_SNAP_DISTANCE, g_snap_distance);
     write(KEY_RANGE_START, g_range_start);
     write(KEY_RANGE_WIDTH, g_range_width);
@@ -385,6 +406,58 @@ static void save_settings() {
     }
 }
 
+// Where a notch calibration and its offsets are saved. Through the adapter they belong to the port,
+// as before other controllers existed: a Gamecube controller can't be told apart from another.
+// Other controllers' follow the controller to any port, a section per model and serial number,
+// so identical controllers without a serial share one. A calibration through the adapter doesn't
+// fit another controller, and the other way around, so the two never share a section.
+static std::string calibration_section(const PortController& controller) {
+    std::string section = "Controller " + controller.model;
+    if (!controller.serial.empty()) {
+        section += " " + controller.serial;
+    }
+    // ] would end the section name early.
+    section.erase(std::remove_if(section.begin(), section.end(),
+                                 [](char c) {
+                                     return c == ']' || static_cast<unsigned char>(c) < ' ';
+                                 }),
+                  section.end());
+    return section;
+}
+
+// The notch calibration and offsets saved in a section.
+static NotchCalibration load_notches(const std::string& path, const std::string& section) {
+    // NeutralSamples = the 8 raw x,y pairs recorded at rest. Notches = x,y pairs in
+    // NOTCH_NAMES order, offsets from the average neutral.
+    int neutral[NOTCH_COUNT * 2], notches[NOTCH_COUNT * 2];
+    NotchCalibration calibration;
+    calibration.valid = read_ints(path, section, KEY_NEUTRAL, neutral, NOTCH_COUNT * 2, 0, 255) &&
+                        read_ints(path, section, KEY_NOTCHES, notches, NOTCH_COUNT * 2, -128, 127);
+    if (calibration.valid) {
+        uint8_t samples[NOTCH_COUNT][2];
+        for (int i = 0; i < NOTCH_COUNT * 2; ++i) {
+            samples[i / 2][i % 2] = static_cast<uint8_t>(neutral[i]);
+        }
+        set_neutral_samples(calibration, samples);
+        for (int i = 0; i < NOTCH_COUNT * 2; ++i) {
+            calibration.notch[i / 2][i % 2] = static_cast<int8_t>(notches[i]);
+        }
+        calibration.valid = misplaced_notch(calibration) < 0;  // a hand-edited file could break the warp
+    }
+    // NotchOffsets = x,y pairs in NOTCH_NAMES order. One a hand-edited file puts out of bounds
+    // stays 0, 0.
+    int offsets[NOTCH_COUNT * 2];
+    if (read_ints(path, section, KEY_NOTCH_OFFSETS, offsets, NOTCH_COUNT * 2, -128, 127)) {
+        for (int i = 0; i < NOTCH_COUNT; ++i) {
+            if (notch_offset_allowed(i, offsets[2 * i], offsets[2 * i + 1])) {
+                calibration.offset[i][0] = static_cast<int8_t>(offsets[2 * i]);
+                calibration.offset[i][1] = static_cast<int8_t>(offsets[2 * i + 1]);
+            }
+        }
+    }
+    return calibration;
+}
+
 static void load_settings() {
     const std::string path = settings_path();
     auto read = [&](const char* key, int fallback) {
@@ -393,6 +466,7 @@ static void load_settings() {
     // A settings file from a dev build may still say SoH; other builds leave it alone and play on VC.
     g_game = SOH_FEATURES && read(KEY_GAME, 0) == 1 ? Game::SoH : Game::WiiVC;
     g_input_lag = SOH_FEATURES ? read(KEY_INPUT_LAG, 0) : 0;
+    g_source = read(KEY_SOURCE, 0) == 1 ? Source::Gamepads : Source::Adapter;
     g_snap_distance = read(KEY_SNAP_DISTANCE, DEFAULT_SNAP_DISTANCE);
     constexpr int MISSING = -2;
     if (read(KEY_RANGE_START, MISSING) == MISSING && read(KEY_OLD_RANGE_START, MISSING) != MISSING) {
@@ -419,35 +493,24 @@ static void load_settings() {
     for (int p = 0; p < PORT_COUNT; ++p) {
         g_ess[p] = ini_read_int(path, port_section(p), KEY_ESS, 1) != 0;
 
-        // NeutralSamples = the 8 raw x,y pairs recorded at rest. Notches = x,y pairs in
-        // NOTCH_NAMES order, offsets from the average neutral.
-        int neutral[NOTCH_COUNT * 2], notches[NOTCH_COUNT * 2];
-        NotchCalibration calibration;
-        calibration.valid = read_ints(path, port_section(p), KEY_NEUTRAL, neutral, NOTCH_COUNT * 2, 0, 255) &&
-                            read_ints(path, port_section(p), KEY_NOTCHES, notches, NOTCH_COUNT * 2, -128, 127);
-        if (calibration.valid) {
-            uint8_t samples[NOTCH_COUNT][2];
-            for (int i = 0; i < NOTCH_COUNT * 2; ++i) {
-                samples[i / 2][i % 2] = static_cast<uint8_t>(neutral[i]);
-            }
-            set_neutral_samples(calibration, samples);
-            for (int i = 0; i < NOTCH_COUNT * 2; ++i) {
-                calibration.notch[i / 2][i % 2] = static_cast<int8_t>(notches[i]);
-            }
-            calibration.valid = misplaced_notch(calibration) < 0;  // a hand-edited file could break the warp
-        }
-        // NotchOffsets = x,y pairs in NOTCH_NAMES order. One a hand-edited file puts out of bounds
-        // stays 0, 0.
-        int offsets[NOTCH_COUNT * 2];
-        if (read_ints(path, port_section(p), KEY_NOTCH_OFFSETS, offsets, NOTCH_COUNT * 2, -128, 127)) {
-            for (int i = 0; i < NOTCH_COUNT; ++i) {
-                if (notch_offset_allowed(i, offsets[2 * i], offsets[2 * i + 1])) {
-                    calibration.offset[i][0] = static_cast<int8_t>(offsets[2 * i]);
-                    calibration.offset[i][1] = static_cast<int8_t>(offsets[2 * i + 1]);
-                }
-            }
-        }
-        g_notches[p] = calibration;
+        PortController controller;
+        controller.model = ini_read(path, port_section(p), KEY_CONTROLLER_MODEL).value_or("");
+        controller.serial = ini_read(path, port_section(p), KEY_CONTROLLER_SERIAL).value_or("");
+        controller.name = ini_read(path, port_section(p), KEY_CONTROLLER_NAME).value_or("");
+        g_gamepads.set_port_controller(p, controller);
+    }
+}
+
+static void save_port_controllers() {
+    const std::string path = settings_path();
+    for (int p = 0; p < PORT_COUNT; ++p) {
+        const PortController controller = g_gamepads.port_controller(p);
+        auto value = [&](const std::string& text) {
+            return controller.model.empty() || text.empty() ? std::nullopt : std::optional<std::string>(text);
+        };
+        ini_write(path, port_section(p), KEY_CONTROLLER_MODEL, value(controller.model));
+        ini_write(path, port_section(p), KEY_CONTROLLER_SERIAL, value(controller.serial));
+        ini_write(path, port_section(p), KEY_CONTROLLER_NAME, value(controller.name));
     }
 }
 
@@ -456,10 +519,18 @@ static void save_ess(int port) {
 }
 
 static void clear_notches(int port) {
+    std::string section;
+    {
+        std::lock_guard lock(g_mutex);
+        section = g_sections[port];
+    }
+    if (section.empty()) {
+        return;
+    }
     const std::string path = settings_path();
-    ini_write(path, port_section(port), KEY_NEUTRAL, std::nullopt);
-    ini_write(path, port_section(port), KEY_NOTCHES, std::nullopt);
-    ini_write(path, port_section(port), KEY_NOTCH_OFFSETS, std::nullopt);
+    ini_write(path, section, KEY_NEUTRAL, std::nullopt);
+    ini_write(path, section, KEY_NOTCHES, std::nullopt);
+    ini_write(path, section, KEY_NOTCH_OFFSETS, std::nullopt);
 }
 
 // A -/+ button in the notch offsets window: which notch and axis it steps, and which way.
@@ -586,17 +657,21 @@ static std::string join_pairs(const T (&pairs)[NOTCH_COUNT][2]) {
 
 static void save_notch_offsets(int port) {
     NotchCalibration calibration;
+    std::string section;
     {
         std::lock_guard lock(g_mutex);
         calibration = g_notches[port];
+        section = g_sections[port];
     }
-    ini_write(settings_path(), port_section(port), KEY_NOTCH_OFFSETS, join_pairs(calibration.offset));
+    if (!section.empty()) {
+        ini_write(settings_path(), section, KEY_NOTCH_OFFSETS, join_pairs(calibration.offset));
+    }
 }
 
-static void save_notches(int port, const NotchCalibration& calibration) {
+static void save_notches(const std::string& section, const NotchCalibration& calibration) {
     const std::string path = settings_path();
-    ini_write(path, port_section(port), KEY_NEUTRAL, join_pairs(calibration.neutral_samples));
-    ini_write(path, port_section(port), KEY_NOTCHES, join_pairs(calibration.notch));
+    ini_write(path, section, KEY_NEUTRAL, join_pairs(calibration.neutral_samples));
+    ini_write(path, section, KEY_NOTCHES, join_pairs(calibration.notch));
 }
 
 static void set_adapter_status(const std::string& status) {
@@ -660,21 +735,35 @@ static GCPortState center(const GCPortState& raw, const GCPortState& origin) {
 
 static void bridge_loop() {
     GCAdapter adapter;
+    InputSource* source = nullptr;  // the one g_source picks
     AdapterFrame raw{}, centered{}, calibrated{}, out{}, sent{}, origin{};
     bool has_origin[PORT_COUNT] = {};
+    std::array<uint32_t, PORT_COUNT> port_ids{};  // with other controllers, the controller behind each port
     bool prev_a[PORT_COUNT] = {}, prev_b[PORT_COUNT] = {};
     uint8_t samples[CALIBRATION_STEPS][2] = {};  // raw stick per calibration step
     // Everything goes out through here, so input lag delays it all, disconnects included.
     DelayedSender sender([](const AdapterFrame& frame, Game game) { g_dsu.publish(frame, game); });
 
-    auto take_calibration_request = [] {
+    std::string calibrating_section;  // where the calibration in progress is for (see g_sections)
+    auto take_calibration_request = [&] {
         const int request = g_calibration_request.exchange(NO_REQUEST);
         if (request != NO_REQUEST) {
             g_calibration_step = 0;
             g_calibrating_port = request;
+            if (request >= 0) {
+                std::lock_guard lock(g_mutex);
+                calibrating_section = g_sections[request];
+            }
         }
     };
-    // Without an adapter, forget every controller: the next one plugged in gets a fresh origin,
+    // Sets where a port's calibration lives, and loads it.
+    auto use_section = [&](int port, const std::string& section) {
+        const NotchCalibration calibration = section.empty() ? NotchCalibration{} : load_notches(settings_path(), section);
+        std::lock_guard lock(g_mutex);
+        g_sections[port] = section;
+        g_notches[port] = calibration;
+    };
+    // Without an input source, forget every controller: the next one plugged in gets a fresh origin,
     // and the windows stop showing stale controllers and stick positions.
     auto forget_controllers = [&] {
         raw = {};
@@ -693,23 +782,60 @@ static void bridge_loop() {
 
     while (g_running) {
         take_calibration_request();
-        if (!adapter.is_open() && !adapter.open()) {
-            set_adapter_status(adapter.last_error());
+        // Switching sources lets go of the old one, so Dolphin can have the adapter.
+        InputSource* chosen = g_source == Source::Gamepads ? static_cast<InputSource*>(&g_gamepads) : &adapter;
+        if (chosen != source) {
+            if (source) {
+                source->close();
+            }
+            source = chosen;
+            forget_controllers();
+            // The adapter's calibrations belong to its ports. Other controllers' are loaded below
+            // as each one takes a port.
+            port_ids = {};
+            for (int p = 0; p < PORT_COUNT; ++p) {
+                use_section(p, source == &adapter ? port_section(p) : std::string());
+            }
+        }
+        if (!source->is_open() && !source->open()) {
+            set_adapter_status(source->last_error());
             forget_controllers();
             wait(1000);
             continue;
         }
 
-        const GCAdapter::ReadResult result = adapter.read(raw);
-        if (result == GCAdapter::ReadResult::Timeout) {
+        const InputSource::ReadResult result = source->read(raw);
+        if (result == InputSource::ReadResult::Timeout) {
             continue;
         }
-        if (result == GCAdapter::ReadResult::Error) {
-            set_adapter_status(adapter.last_error());
-            adapter.close();
+        if (result == InputSource::ReadResult::Error) {
+            set_adapter_status(source->last_error());
+            source->close();
             forget_controllers();
             wait(100);  // don't spin if the adapter keeps failing right after opening
             continue;
+        }
+
+        // With other controllers, another controller can take over a port without the port ever
+        // reading as unplugged (a swap, or a waiting controller moving into a freed port). It
+        // gets its own origin and its own calibration, and a calibration in progress on the port
+        // starts over for it.
+        if (source == &g_gamepads) {
+            for (int p = 0; p < PORT_COUNT; ++p) {
+                const uint32_t id = g_gamepads.frame_ids()[p];
+                if (id == port_ids[p]) {
+                    continue;
+                }
+                const std::optional<PortController> controller = id ? g_gamepads.controller(id) : std::nullopt;
+                const std::string section = controller ? calibration_section(*controller) : std::string();
+                use_section(p, section);
+                has_origin[p] = false;
+                if (p == g_calibrating_port) {
+                    g_calibration_step = 0;
+                    calibrating_section = section;
+                }
+            }
+            port_ids = g_gamepads.frame_ids();
         }
 
         NotchCalibration notches[PORT_COUNT];
@@ -717,7 +843,6 @@ static void bridge_loop() {
             std::lock_guard lock(g_mutex);
             std::copy(std::begin(g_notches), std::end(g_notches), notches);
         }
-
         for (int p = 0; p < PORT_COUNT; ++p) {
             // Like Dolphin and the console: the first report after plugging in is the origin.
             if (raw[p].connected && !has_origin[p]) {
@@ -765,17 +890,26 @@ static void bridge_loop() {
                         g_calibration_step = 2 * misplaced;
                         ask_again(misplaced);
                     } else {
-                        save_notches(p, calibration);
+                        bool kept = false;
                         {
-                            // Calibrating again keeps the notch offsets.
+                            // Only if the port still saves where the calibration started. After
+                            // switching source the frame may still be the old source's: then it
+                            // belongs to the old source, and goes nowhere.
                             std::lock_guard lock(g_mutex);
-                            NotchCalibration with_offsets = calibration;
-                            std::copy(&g_notches[p].offset[0][0], &g_notches[p].offset[0][0] + NOTCH_COUNT * 2,
-                                      &with_offsets.offset[0][0]);
-                            g_notches[p] = with_offsets;
+                            if (!calibrating_section.empty() && g_sections[p] == calibrating_section) {
+                                // Calibrating again keeps the notch offsets.
+                                NotchCalibration with_offsets = calibration;
+                                std::copy(&g_notches[p].offset[0][0], &g_notches[p].offset[0][0] + NOTCH_COUNT * 2,
+                                          &with_offsets.offset[0][0]);
+                                g_notches[p] = with_offsets;
+                                kept = true;
+                            }
                         }
                         g_calibrating_port = -1;
-                        set_notice("Port " + std::to_string(p + 1) + " notches calibrated and saved.");
+                        if (kept) {
+                            save_notches(calibrating_section, calibration);
+                            set_notice("Port " + std::to_string(p + 1) + " notches calibrated and saved.");
+                        }
                     }
                 }
             }
@@ -805,7 +939,10 @@ static void bridge_loop() {
         while (g_out_history.front().at < now - std::chrono::milliseconds(MAX_INPUT_LAG_MS + 50)) {
             g_out_history.pop_front();
         }
-        g_adapter_status = "Adapter connected";
+        g_adapter_status = source->status();
+    }
+    if (source) {
+        source->close();  // SDL closes on the thread that opened it
     }
 }
 
@@ -979,7 +1116,8 @@ private:
     bool centered_, dim_;
 };
 
-// The push buttons, the ESS checkboxes, and the "Playing on" toggles, all in dark colors.
+// The push buttons, the ESS checkboxes, and the "Controllers" and "Playing on" toggles, all in
+// dark colors.
 class Button : public Fl_Widget {
 public:
     Button(int x, int y, int w, int h, const char* text, int id) : Fl_Widget(x, y, w, h) {
@@ -1057,9 +1195,10 @@ public:
             }
             text_rect.left += size + 6;
             centered = false;
-        } else if (id == ID_GAME_VC || id == ID_GAME_SOH) {
-            // The chosen game is filled in, like a checked ESS box.
-            const bool chosen = (id == ID_GAME_SOH) == (g_game == Game::SoH);
+        } else if (id == ID_GAME_VC || id == ID_GAME_SOH || id == ID_SOURCE_ADAPTER || id == ID_SOURCE_GAMEPADS) {
+            // The chosen game or source is filled in, like a checked ESS box.
+            const bool chosen = id == ID_GAME_VC || id == ID_GAME_SOH ? (id == ID_GAME_SOH) == (g_game == Game::SoH)
+                                                                      : (id == ID_SOURCE_GAMEPADS) == (g_source == Source::Gamepads);
             fill(rect, chosen ? COLOR_ACCENT : pressed_ ? COLOR_FACE_DOWN : COLOR_FACE);
             frame(rect, chosen ? COLOR_ACCENT : COLOR_BORDER);
         } else {
@@ -1102,6 +1241,137 @@ public:
 
 private:
     void (*paint_)();
+};
+
+// The dropdown's menu, drawn in the window colors: its box has a 1 pixel border, and its items are
+// plain text, 24 pixels high, lined up with the text in the dropdown.
+static const Fl_Boxtype MENU_BOX = FL_FREE_BOXTYPE;
+static const Fl_Labeltype MENU_ITEM_LABEL = FL_FREE_LABELTYPE;
+static constexpr int MENU_ITEM_HEIGHT = 24;
+
+static void register_menu_style() {
+    Fl::set_boxtype(
+        MENU_BOX,
+        [](int x, int y, int w, int h, Fl_Color color) {
+            fill({x, y, x + w, y + h}, color);
+            frame({x, y, x + w, y + h}, COLOR_BORDER);
+        },
+        1, 1, 2, 2);
+    // FLTK adds Fl::menu_linespacing() to the height measured here, and draws the label 4 pixels
+    // in from the menu's left edge, past its border.
+    Fl::set_labeltype(
+        MENU_ITEM_LABEL,
+        [](const Fl_Label* label, int x, int y, int w, int h, Fl_Align) {
+            fl_font(label->font, label->size);
+            fl_color(label->color);
+            draw_text_in(label->value, {x + 2, y, x + w, y + h}, false);
+        },
+        [](const Fl_Label* label, int& w, int& h) {
+            fl_font(label->font, label->size);
+            w = static_cast<int>(fl_width(label->value)) + 12;
+            h = MENU_ITEM_HEIGHT - Fl::menu_linespacing();
+        });
+}
+
+// A port's controller, with other controllers: drawn like a push button with an arrow, and opens
+// a menu of "Any controller" and every connected controller, the port's choice in the accent color.
+class Dropdown : public Fl_Menu_Button {
+public:
+    Dropdown(int x, int y, int w, int h, int port) : Fl_Menu_Button(x, y, w, h), port_(port) {
+        static const bool registered = (register_menu_style(), true);
+        (void)registered;
+        argument(ID_PORT_PICK + port);
+        box(FL_FLAT_BOX);
+        menu_box(MENU_BOX);
+        down_box(FL_FLAT_BOX);
+        color(COLOR_FACE);
+        selection_color(COLOR_FACE_DOWN);
+        textcolor(COLOR_TEXT);
+        textfont(FONT_UI);
+        textsize(FONT_SIZE);
+        labelfont(FONT_UI);
+        labelsize(FONT_SIZE);
+    }
+
+    int handle(int event) override {
+        switch (event) {
+        case FL_PUSH:
+            if (Fl::event_button() != FL_LEFT_MOUSE) {
+                return 0;
+            }
+            take_focus();
+            open();
+            return 1;
+        case FL_FOCUS:
+            if (!g_keyboard_used) {
+                return 0;
+            }
+            redraw();
+            return 1;
+        case FL_UNFOCUS:
+            redraw();
+            return 1;
+        case FL_KEYBOARD:
+            if (Fl::event_key() == ' ' && g_keyboard_used) {
+                open();
+                return 1;
+            }
+            return 0;
+        }
+        return 0;
+    }
+
+    void draw() override {
+        const Rect rect = {x(), y(), x() + w(), y() + h()};
+        fill(rect, COLOR_FACE);
+        frame(rect, COLOR_BORDER);
+        fl_font(labelfont(), labelsize());
+        fl_color(COLOR_TEXT);
+        fl_push_clip(rect.left + 6, rect.top, w() - 24, h());
+        draw_text_in(label() ? label() : "", {rect.left + 6, rect.top, rect.right - 18, rect.bottom}, false);
+        fl_pop_clip();
+        const int cx = rect.right - 11, cy = (rect.top + rect.bottom) / 2;
+        fl_polygon(cx - 4, cy - 2, cx + 4, cy - 2, cx, cy + 2);
+        if (Fl::focus() == this && g_keyboard_used) {
+            frame(rect, COLOR_ACCENT);
+        }
+    }
+
+private:
+    void open() {
+        const std::vector<GamepadInfo> pads = g_gamepads.connected();
+        const bool keeps_one = !g_gamepads.port_controller(port_).model.empty();
+        std::vector<std::string> labels = {"Any controller"};
+        for (const GamepadInfo& pad : pads) {
+            const std::string where = pad.port == port_ ? ""
+                                      : pad.port < 0    ? " (no port)"
+                                                        : " (port " + std::to_string(pad.port + 1) + ")";
+            labels.push_back(pad.name + where);
+        }
+        std::vector<Fl_Menu_Item> items(labels.size() + 1, Fl_Menu_Item{});  // ends with an empty item
+        for (size_t i = 0; i < labels.size(); ++i) {
+            const bool chosen = i == 0 ? !keeps_one : keeps_one && pads[i - 1].port == port_;
+            items[i].text = labels[i].c_str();
+            items[i].labeltype_ = MENU_ITEM_LABEL;
+            items[i].labelfont_ = FONT_UI;
+            items[i].labelsize_ = FONT_SIZE;
+            items[i].labelcolor_ = chosen ? COLOR_DOT_IN_RANGE : COLOR_TEXT;
+        }
+        menu(items.data());
+        const Fl_Menu_Item* picked = popup();
+        menu(nullptr);
+        if (picked) {
+            const size_t i = static_cast<size_t>(picked - items.data());
+            if (i == 0) {
+                g_gamepads.pick_any(port_);
+            } else if (!g_gamepads.pick(port_, pads[i - 1].id)) {
+                set_notice(pads[i - 1].name + " was unplugged.");
+            }
+            save_port_controllers();
+        }
+    }
+
+    int port_;
 };
 
 static Text* add_text(DarkWindow* window, const char* text, int x, int y, int w, int h, int id, bool centered = false) {
@@ -1183,14 +1453,12 @@ static int map_port(const AdapterFrame& raw) {
 }
 
 static void refresh_settings(DarkWindow* window) {
-    AdapterFrame raw, centered, out;
+    AdapterFrame raw;
     bool calibrated[PORT_COUNT];
     std::string notice;
     {
         std::lock_guard lock(g_mutex);
         raw = g_raw;
-        centered = g_centered;
-        out = game_has_now();  // the Game readout lags like the game
         for (int p = 0; p < PORT_COUNT; ++p) {
             calibrated[p] = g_notches[p].valid;
         }
@@ -1199,20 +1467,31 @@ static void refresh_settings(DarkWindow* window) {
         }
     }
 
+    auto show = [](Fl_Widget* control, bool shown) {
+        if ((control->visible() != 0) != shown) {
+            if (shown) {
+                control->show();
+            } else {
+                control->hide();
+            }
+        }
+    };
+    // With other controllers, each port picks its controller. The adapter's ports are fixed.
+    const bool gamepads = g_source == Source::Gamepads;
+    const std::vector<GamepadInfo> pads = gamepads ? g_gamepads.connected() : std::vector<GamepadInfo>{};
     const int calibrating = g_calibrating_port;
     for (int p = 0; p < PORT_COUNT; ++p) {
-        std::string text = "No controller";
-        if (raw[p].connected) {
-            // Stick convention: neutral is 0, 0, right and up are positive. "Game" is what OoT
-            // sees after Wii VC or SoH. Fixed-width fields in a monospace font so nothing shifts.
-            int in_game[2];
-            game_in_game(g_game, out[p].stick[0], out[p].stick[1], in_game);
-            char buffer[64];
-            std::snprintf(buffer, sizeof(buffer), "Stick %4d,%4d  Game %3d,%3d", centered[p].stick[0] - 128, centered[p].stick[1] - 128,
-                          in_game[0], in_game[1]);
-            text = buffer;
+        show(window->control(ID_PORT_TEXT + p), !gamepads);
+        show(window->control(ID_PORT_PICK + p), gamepads);
+        if (gamepads) {
+            const auto pad = std::find_if(pads.begin(), pads.end(), [p](const GamepadInfo& info) {
+                return info.port == p;
+            });
+            const PortController kept = g_gamepads.port_controller(p);
+            set_text(window, ID_PORT_PICK + p, pad != pads.end() ? pad->name : !kept.model.empty() ? kept.name + " (unplugged)" : "No controller");
+        } else {
+            set_text(window, ID_PORT_TEXT + p, raw[p].connected ? "Controller connected" : "No controller");
         }
-        set_text(window, ID_PORT_TEXT + p, text);
         // A calibrated port shows Notch offsets and Clear in place of the text, except while it calibrates.
         set_text(window, ID_NOTCH_TEXT + p, calibrating == p ? "Calibrating" : calibrated[p] ? "" : "Not calibrated");
         const bool show_buttons = calibrated[p] && calibrating != p;
@@ -1434,6 +1713,41 @@ static void draw_legend(const Plot& plot) {
     }
 }
 
+// Each port's stick and what OoT reads, under the legend. Stick convention: neutral is 0, 0, right
+// and up are positive. "Game" is what OoT sees after Wii VC or SoH. Fixed-width columns in a
+// monospace font, so nothing shifts.
+static void draw_readouts(const AdapterFrame& centered, const AdapterFrame& out) {
+    const Rect area = {GAME_PLOT.right, GAME_PLOT.top + 20 * static_cast<int>(std::size(ZONE_NAMES)), GAME_PLOT.right + LEGEND_WIDTH, STICK_PLOT.bottom};
+    fl_push_clip(area.left, area.top, area.right - area.left, area.bottom - area.top);
+    fill(area, COLOR_BG);
+    const int x = area.left + 12, top = area.top + 10;
+    fl_font(FONT_MONO, FONT_SIZE);
+    const int stick_x = x + static_cast<int>(fl_width("0 ")), game_x = x + static_cast<int>(fl_width("0 -105,-105  "));
+    fl_font(FONT_UI, FONT_SIZE);
+    fl_color(COLOR_DIM_TEXT);
+    draw_text_at("Stick", stick_x, top);
+    draw_text_at("Game", game_x, top);
+    fl_font(FONT_MONO, FONT_SIZE);
+    for (int p = 0; p < PORT_COUNT; ++p) {
+        const int y = top + 20 + p * 16;
+        fl_color(COLOR_TEXT);
+        draw_text_at(std::to_string(p + 1), x, y);
+        if (!out[p].connected) {
+            fl_color(COLOR_DIM_TEXT);
+            draw_text_at("-", stick_x, y);
+            continue;
+        }
+        int in_game[2];
+        game_in_game(g_game, out[p].stick[0], out[p].stick[1], in_game);
+        char stick[16], game[16];
+        std::snprintf(stick, sizeof(stick), "%4d,%4d", centered[p].stick[0] - 128, centered[p].stick[1] - 128);
+        std::snprintf(game, sizeof(game), "%3d,%3d", in_game[0], in_game[1]);
+        draw_text_at(stick, stick_x, y);
+        draw_text_at(game, game_x, y);
+    }
+    fl_pop_clip();
+}
+
 // The settings a zone map is made from, as a key.
 static std::vector<int> zone_map_key(int port, const StickSettings& settings) {
     return {port,           static_cast<int>(settings.game), settings.ess, settings.range_start, settings.range_end, settings.full_speed_start,
@@ -1515,6 +1829,7 @@ static void paint_plots() {
         }
         draw_legend(plot);
     });
+    draw_readouts(centered, out);  // the Game readout lags like the game
 }
 
 // Asks a yes/no question over the window.
@@ -1590,6 +1905,19 @@ static void on_settings_command(DarkWindow* window, int id) {
         save_settings();
         redraw_control(window, ID_GAME_VC);
         redraw_control(window, ID_GAME_SOH);
+    } else if (id == ID_SOURCE_ADAPTER || id == ID_SOURCE_GAMEPADS) {
+        const Source source = id == ID_SOURCE_GAMEPADS ? Source::Gamepads : Source::Adapter;
+        if (source != g_source) {
+            // The bridge thread switches to the new source's calibrations. Stop calibrating first.
+            if (g_offsets_window) {
+                g_offsets_window->close();
+            }
+            g_calibration_request = -1;
+            g_source = source;
+        }
+        save_settings();
+        redraw_control(window, ID_SOURCE_ADAPTER);
+        redraw_control(window, ID_SOURCE_GAMEPADS);
     } else if (id == ID_RANGE_DEFAULT) {
         g_range_start = ESS_START_DEFAULT;
         g_range_width = ESS_RANGE_DEFAULT;
@@ -1622,7 +1950,8 @@ static void open_settings() {
         const std::string label = "Port " + std::to_string(p + 1) + " ESS";
         add_button(window, label.c_str(), 10, y, 85, 22, ID_ESS_CHECK + p);
         add_button(window, "Calibrate", 100, y, 75, 22, ID_CALIBRATE + p);
-        add_text(window, "", 185, y + 3, 212, 18, ID_PORT_TEXT + p)->labelfont(FONT_MONO);
+        add_text(window, "", 185, y + 3, 212, 18, ID_PORT_TEXT + p);
+        window->add(new Dropdown(185, y, 212, 22, p));
         add_text(window, "", 404, y + 3, 134, 18, ID_NOTCH_TEXT + p);
         add_button(window, "Notch offsets", 404, y, 86, 22, ID_NOTCH_OFFSETS + p)->hide();
         add_button(window, "Clear", 494, y, 44, 22, ID_CLEAR_NOTCHES + p)->hide();
@@ -1654,14 +1983,18 @@ static void open_settings() {
         stepper(control_x, 224, ID_DEAD_ZONE_MINUS, ID_DEAD_ZONE_VALUE, ID_DEAD_ZONE_PLUS);
         add_dim_text(window, "stick units, 0 = off", hint_x, 227, 115, 18, ID_DEAD_ZONE_HINT);
 
-        if (SOH_FEATURES) {
-            add_text(window, "Playing on", label_x, 257, 130, 18, ID_GAME_LABEL);
-            add_button(window, "Dolphin (Wii VC)", control_x, 254, 130, 22, ID_GAME_VC);
-            add_button(window, "Ship of Harkinian", control_x + 134, 254, 130, 22, ID_GAME_SOH);
+        add_text(window, "Controllers", label_x, 257, 130, 18, ID_SOURCE_LABEL);
+        add_button(window, "Gamecube adapter", control_x, 254, 130, 22, ID_SOURCE_ADAPTER);
+        add_button(window, "Other controllers", control_x + 134, 254, 130, 22, ID_SOURCE_GAMEPADS);
 
-            add_text(window, "Input lag", label_x, 287, 130, 18, ID_LAG_LABEL);
-            stepper(control_x, 284, ID_LAG_MINUS, ID_LAG_VALUE, ID_LAG_PLUS);
-            add_dim_text(window, "ms, SoH only, 0 = off", hint_x, 287, 115, 18, ID_LAG_HINT);
+        if (SOH_FEATURES) {
+            add_text(window, "Playing on", label_x, 287, 130, 18, ID_GAME_LABEL);
+            add_button(window, "Dolphin (Wii VC)", control_x, 284, 130, 22, ID_GAME_VC);
+            add_button(window, "Ship of Harkinian", control_x + 134, 284, 130, 22, ID_GAME_SOH);
+
+            add_text(window, "Input lag", label_x, 317, 130, 18, ID_LAG_LABEL);
+            stepper(control_x, 314, ID_LAG_MINUS, ID_LAG_VALUE, ID_LAG_PLUS);
+            add_dim_text(window, "ms, SoH only, 0 = off", hint_x, 317, 115, 18, ID_LAG_HINT);
         }
     }
     add_text(window, "", STICK_PLOT.left, STICK_PLOT.top - 20, 250, 18, ID_STICK_PLOT_TITLE);

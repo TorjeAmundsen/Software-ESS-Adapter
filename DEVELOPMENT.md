@@ -6,6 +6,14 @@ How the program works, how to build it, and where things are in the source. For 
 
 Dolphin's own adapter support reads the USB device directly, and nothing else can hook into that path. So the program claims the adapter (WUP-028) with libusb, runs each report through origin centering (with the calibrated neutral range), the notch warp, notch snapping, the ESS range, the dead zone, the ESS map and a pass that keeps each axis moving with its input in game, and serves the result to Dolphin (or Ship of Harkinian) as a DSU (cemuhook) controller over UDP on `127.0.0.1:26760`. It forwards every adapter report as it arrives, so its rate matches the adapter's (125 Hz stock, higher when overclocked).
 
+### Other controllers
+
+With Controllers set to Other controllers, `bridge_loop` closes the adapter, so Dolphin can have it, and reads controllers through SDL 3 (`src/gamepads.cpp`) instead. Both sources implement `InputSource` (`src/input_source.hpp`) and fill the same `AdapterFrame`, so everything after the read (centering, calibration, `process_stick`, DSU) is the same for both. Each controller becomes a Gamecube controller: sticks scale so full tilt is `GATE_STRAIGHT` (105) from center, triggers scale to 0 to 255 and also press the digital L or R past 90%, and buttons go by position (SDL's south, east, west and north are A, B, X and Y, so A and B sit as in OoT's button display), with the right shoulder as Z.
+
+Each port keeps a picked controller (`PortController`: SDL's GUID for the model, the serial number if the controller reports one, and the name to show while it's unplugged), saved per port as `ControllerModel`, `ControllerSerial` and `ControllerName`, or takes any controller. A controller that connects goes to the port that keeps it, or else the first free port that takes any. A port keeping an unplugged controller stays empty until it comes back. Without a serial number, any controller of the model matches, so two identical ones can swap. Picking a controller from another port swaps the two ports and what they keep. Notch calibrations and offsets follow the controller. `g_sections` says which settings file section holds each port's: `Port1` to `Port4` with the adapter, as before, since Gamecube controllers can't be told apart, and with other controllers a `Controller <model> <serial>` section per controller (`calibration_section`), shared by identical controllers without a serial. Adapter calibrations never fit other controllers, and the sections keep them apart. `Gamepads::read` records which controller fed each port (`frame_ids`). When that changes, the bridge thread loads the new controller's calibration, takes a new origin, and restarts a calibration in progress on the port. A finished calibration is only kept if its port still has the section it started with, which also drops one that finishes right as the source is switched. The windows pick through `Gamepads::pick`, which takes the same lock as the bridge thread's reads. The tests check all this with SDL's virtual controllers.
+
+A read waits up to 8 ms for SDL to report a change, then sends every port's state. So frames go out as fast as the controller changes, and at least at the stock adapter's 125 Hz while nothing moves. Three SDL hints make this work without a window: background events, since Dolphin has the focus; a joystick thread for Windows device and raw input messages; and no SDL GameCube adapter driver, so SDL leaves the adapter to libusb.
+
 ### Does the ESS output survive Dolphin?
 
 Yes, if the stick has no dead zone and no calibration in Dolphin, with one correction on our side. Dolphin turns a DSU stick byte `v` into `(v-128)/127` above center and `(v-128)/128` below, then maps it back to a byte with `MapFloat(x, 128, 1)` (GCPadEmu.cpp), which scales by 127 on both sides. Above center every byte comes back unchanged. Below center, bytes 0 to 64 come back one too high, so ESS full tilt left (64) would arrive as 65. `to_dolphin_stick` in `dsu_server.cpp` sends one less for 1 to 64, so every byte from 1 to 255 arrives as intended (0 can't be reached and arrives as 1). `bridge-tests` checks all of them with Dolphin's formulas. A dead zone or a calibration other than the default in Dolphin rescales the stick and breaks the ESS map. The profile doesn't need to set them: loading a profile resets any setting it leaves out to its default (`NumericSetting::LoadFromIni`), and an empty calibration and center mean the defaults (`ReshapableInput::LoadConfig`).
@@ -58,7 +66,7 @@ DSU copies a PlayStation controller, so Gamecube buttons go out under PlayStatio
 
 ## Build
 
-The windows are drawn with [FLTK](https://www.fltk.org) 1.4, which CMake downloads and links in statically, along with the fonts in `assets/fonts` (see Drawing the windows below).
+The windows are drawn with [FLTK](https://www.fltk.org) 1.4, which CMake downloads and links in statically, along with the fonts in `assets/fonts` (see Drawing the windows below). CMake also downloads [SDL](https://www.libsdl.org) 3.2.24 for other controllers and links in only its gamepad and joystick code, on both platforms, since Ubuntu 22.04 has no SDL 3 package. That adds about 1.5 MB to the program on Windows and 2.4 MB on Linux.
 
 ### Windows
 
@@ -82,7 +90,7 @@ cmake --build build/mingw --target bridge-tests
 
 With MSVC, use `build/msvc` instead.
 
-CMake downloads libusb 1.0.27 and compiles its Windows sources directly, since libusb has no CMake build. libusb only ships a `config.h` for MSVC, so `cmake/libusb-mingw/config.h` provides the same settings for MinGW. To build offline, point CMake at any libusb checkout, for example Dolphin's, with `-DFETCHCONTENT_SOURCE_DIR_LIBUSB="<dolphin>/Externals/libusb/libusb"`, and at an FLTK 1.4.5 checkout with `-DFETCHCONTENT_SOURCE_DIR_FLTK=<fltk>`.
+CMake downloads libusb 1.0.27 and compiles its Windows sources directly, since libusb has no CMake build. libusb only ships a `config.h` for MSVC, so `cmake/libusb-mingw/config.h` provides the same settings for MinGW. To build offline, point CMake at any libusb checkout, for example Dolphin's, with `-DFETCHCONTENT_SOURCE_DIR_LIBUSB="<dolphin>/Externals/libusb/libusb"`, at an FLTK 1.4.5 checkout with `-DFETCHCONTENT_SOURCE_DIR_FLTK=<fltk>`, and at an SDL 3.2.24 checkout with `-DFETCHCONTENT_SOURCE_DIR_SDL3=<sdl>`.
 
 ### Linux
 
@@ -140,7 +148,9 @@ The style is in `.clang-format`: 4-space indents, 140-column lines, and braces o
 ## Source
 
 - `src/ess.cpp` holds the Gamecube functions from `ESS-Adapter/ESS.cpp` in [Skuzee/ESS-Adapter](https://github.com/Skuzee/ESS-Adapter), copied unchanged, with a few defines at the top in place of the Arduino-specific memory macros. If the map changes there, copy the functions here too.
+- `src/input_source.hpp` has the Gamecube port state both input sources fill, and their common interface.
 - `src/gc_adapter.cpp` reads the adapter with libusb, using the same protocol as Dolphin's `GCAdapter.cpp`.
+- `src/gamepads.cpp` reads other controllers with SDL and turns them into Gamecube controllers.
 - `src/dsu_server.cpp` is the UDP server, with packet layouts from Dolphin's `DualShockUDPProto.h`.
 - `src/delayed_sender.cpp` adds the optional input lag on SoH.
 - `src/soh.cpp` has the ESS map's N64 stage for Ship of Harkinian and a copy of SoH's stick math.
@@ -169,6 +179,7 @@ The program is GPLv3 (`LICENSE.md`). The release downloads have no separate lice
 - **libusb:** LGPL 2.1, built in from source on Windows (Linux uses the system's). Its copyright lines come from libusb's `AUTHORS`, and the license text from its `COPYING`.
 - **FLTK:** LGPL 2 with FLTK's exceptions, which allow static linking, from FLTK's `COPYING`.
 - **libpng, zlib, and libdecor:** only in the Linux build, from the copies FLTK includes (`png/LICENSE`, the notice in `zlib/zlib.h`, `libdecor/LICENSE`).
+- **SDL:** zlib license, from SDL's `LICENSE.txt`. SDL's copy of HIDAPI is used under GPLv3, one of the three licenses it offers (`src/hidapi/LICENSE.txt`), so it needs no notice of its own.
 - **Selawik and Cascadia Mono:** SIL Open Font License 1.1, from each font's repository. Both have Reserved Font Names, so the font files stay unmodified (no subsetting).
 - **MinGW-w64 runtime and winpthreads:** only in MinGW builds, from MSYS2's `share/licenses/crt/COPYING.MinGW-w64-runtime.txt` and `share/licenses/winpthreads/COPYING`.
 

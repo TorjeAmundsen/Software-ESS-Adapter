@@ -85,6 +85,22 @@ FetchContent_Declare(fltk
   PATCH_COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch-fltk.cmake)
 FetchContent_MakeAvailable(fltk)
 
+# SDL reads controllers other than the adapter (src/gamepads.cpp): only its gamepad and joystick
+# code, linked statically on both platforms, since Ubuntu 22.04 has no SDL3 package.
+set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+set(SDL_STATIC ON CACHE BOOL "" FORCE)
+set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+foreach(subsystem AUDIO VIDEO GPU RENDER CAMERA SENSOR POWER DIALOG TRAY HAPTIC)
+  set(SDL_${subsystem} OFF CACHE BOOL "" FORCE)
+endforeach()
+# Without video, SDL needs this on Linux or it stops configuring for lack of X11 and Wayland.
+set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+FetchContent_Declare(SDL3
+  GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+  GIT_TAG release-3.2.24
+  GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(SDL3)
+
 # Fonts, license texts, and the Linux window icon, built into the program (src/embedded.hpp).
 set(EMBEDDED_FILES
   GPL_TEXT=${CMAKE_CURRENT_SOURCE_DIR}/LICENSE.md
@@ -110,6 +126,7 @@ add_library(bridge_core STATIC
   src/dsu_server.cpp
   src/ess.cpp
   src/ess_range.cpp
+  src/gamepads.cpp
   src/gc_adapter.cpp
   src/ini.cpp
   src/notch.cpp
@@ -117,7 +134,7 @@ add_library(bridge_core STATIC
   src/stick.cpp)
 target_include_directories(bridge_core PUBLIC src)
 find_package(Threads REQUIRED)
-target_link_libraries(bridge_core PUBLIC usb Threads::Threads)
+target_link_libraries(bridge_core PUBLIC usb SDL3::SDL3-static Threads::Threads)
 if(WIN32)
   target_compile_definitions(bridge_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
   target_link_libraries(bridge_core PUBLIC ws2_32)

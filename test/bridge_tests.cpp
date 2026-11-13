@@ -7,6 +7,8 @@
 // 2. Checks the stick path for Wii VC and Ship of Harkinian: ESS range, dead zone, and the speedrun
 //    rule that each axis's in-game value follows its input.
 // 3. Talks to DsuServer like Dolphin does and checks the pad data that comes back.
+// 4. Checks how other controllers' sticks and triggers turn into Gamecube bytes, and which port
+//    each one gets, with SDL's virtual controllers.
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -29,10 +31,13 @@
 #include <thread>
 #include <utility>
 
+#include <SDL3/SDL.h>
+
 #include "delayed_sender.hpp"
 #include "dsu_server.hpp"
 #include "ess.hpp"
 #include "ess_range.hpp"
+#include "gamepads.hpp"
 #include "ini.hpp"
 #include "notch.hpp"
 #include "soh.hpp"
@@ -1089,6 +1094,122 @@ static void test_delayed_sender() {
     }
 }
 
+static void test_gamepad_conversion() {
+    // Full tilt lands on the Gamecube's straight gate, both ways, and center on 128.
+    CHECK(gamepad_stick_byte(0) == 128);
+    CHECK(gamepad_stick_byte(32767) == 128 + GATE_STRAIGHT);
+    CHECK(gamepad_stick_byte(-32767) == 128 - GATE_STRAIGHT);
+    CHECK(gamepad_stick_byte(-32768) == 128 - GATE_STRAIGHT);  // one past full tilt, clamped
+    CHECK(gamepad_stick_byte(32768) == 128 + GATE_STRAIGHT);   // a negated -32768 y
+    CHECK(gamepad_stick_byte(16384) == 128 + 53);
+    // A round gate's diagonal comes out next to the Gamecube's diagonal notch.
+    const int diagonal = static_cast<int>(std::lround(32767 / std::sqrt(2.0)));
+    CHECK(std::abs(gamepad_stick_byte(diagonal) - 128 - GATE_DIAGONAL) <= 1);
+    int previous = -1;
+    for (int axis = -32768; axis <= 32767; ++axis) {
+        const int byte = gamepad_stick_byte(axis);
+        CHECK(byte >= previous);
+        previous = byte;
+    }
+
+    CHECK(gamepad_trigger_byte(0) == 0);
+    CHECK(gamepad_trigger_byte(32767) == 255);
+    CHECK(gamepad_trigger_byte(-1) == 0);
+    CHECK(TRIGGER_CLICK > 0 && TRIGGER_CLICK < 32767);
+}
+
+// A virtual SDL controller with every gamepad button and axis. Models differ by product id.
+static SDL_JoystickID attach_pad(const char* name, Uint16 product) {
+    SDL_VirtualJoystickDesc desc;
+    SDL_INIT_INTERFACE(&desc);
+    desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    desc.vendor_id = 0x1234;
+    desc.product_id = product;
+    desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    desc.name = name;
+    return SDL_AttachVirtualJoystick(&desc);
+}
+
+static void test_gamepad_ports() {
+    // Only the virtual controllers below: real ones would take ports first.
+    for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_XINPUT_ENABLED, SDL_HINT_JOYSTICK_WGI,
+                             SDL_HINT_JOYSTICK_DIRECTINPUT, SDL_HINT_JOYSTICK_GAMEINPUT}) {
+        SDL_SetHint(hint, "0");
+    }
+    Gamepads pads;
+    CHECK(pads.open());
+    AdapterFrame frame;
+    pads.read(frame);
+    if (!pads.connected().empty()) {
+        std::printf("gamepad ports: skipped, unplug the controllers to run it\n");
+        pads.close();
+        return;
+    }
+    auto port_of = [&](SDL_JoystickID id) {
+        pads.read(frame);
+        for (const GamepadInfo& info : pads.connected()) {
+            if (info.id == id) {
+                return info.port;
+            }
+        }
+        return -2;  // not connected
+    };
+
+    // Ports start out taking any controller, in the order they connect.
+    const SDL_JoystickID a = attach_pad("Pad A", 1), b = attach_pad("Pad B", 2);
+    CHECK(port_of(a) == 0);
+    CHECK(port_of(b) == 1);
+
+    // Picking A for port 2 swaps it with B, and port 2 keeps A from then on.
+    CHECK(pads.pick(1, a));
+    CHECK(port_of(a) == 1);
+    CHECK(port_of(b) == 0);
+    CHECK(pads.port_controller(1).name == "Pad A");
+    // The frame says which controller is behind each port, so a swap can't go unnoticed.
+    CHECK(pads.frame_ids()[0] == b && pads.frame_ids()[1] == a);
+    CHECK(pads.controller(a) && pads.controller(a)->name == "Pad A");
+    CHECK(pads.port_controller(0).model.empty());
+
+    // Port 2 waits for A while it's unplugged: another controller takes port 3 instead.
+    SDL_DetachVirtualJoystick(a);
+    CHECK(port_of(a) == -2);
+    CHECK(!frame[1].connected);
+    const SDL_JoystickID c = attach_pad("Pad C", 3);
+    CHECK(port_of(c) == 2);
+    // A comes back to port 2 when it's plugged in again, now with a new id.
+    const SDL_JoystickID a2 = attach_pad("Pad A", 1);
+    CHECK(port_of(a2) == 1);
+
+    // The stick and buttons come through on A's port.
+    SDL_Joystick* joystick = SDL_OpenJoystick(a2);
+    SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_LEFTX, 32767);
+    SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_LEFTY, 32767);  // down
+    SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_EAST, true);
+    pads.read(frame);
+    CHECK(frame[1].connected);
+    CHECK(frame[1].stick[0] == 128 + GATE_STRAIGHT);
+    CHECK(frame[1].stick[1] == 128 - GATE_STRAIGHT);
+    CHECK(frame[1].buttons1 == 0x03);  // A and B
+    SDL_CloseJoystick(joystick);
+
+    // Any controller again: port 2 no longer waits for A.
+    // Picking a controller that's gone changes nothing.
+    CHECK(!pads.pick(1, 0xFFFFFF));
+    CHECK(pads.port_controller(1).name == "Pad A");
+    pads.pick_any(1);
+    CHECK(pads.port_controller(1).model.empty());
+    SDL_DetachVirtualJoystick(a2);
+    const SDL_JoystickID d = attach_pad("Pad D", 4);
+    CHECK(port_of(d) == 1);
+
+    for (const SDL_JoystickID id : {b, c, d}) {
+        SDL_DetachVirtualJoystick(id);
+    }
+    pads.close();
+}
+
 int main() {
 #ifdef _WIN32
     WSADATA wsa;
@@ -1110,6 +1231,8 @@ int main() {
     test_ini();
     test_dsu_server();
     test_delayed_sender();
+    test_gamepad_conversion();
+    test_gamepad_ports();
 #ifdef _WIN32
     WSACleanup();
 #endif

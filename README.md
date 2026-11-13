@@ -31,6 +31,16 @@ How it works and how to build it is in [DEVELOPMENT.md](DEVELOPMENT.md).
 
 That's it. Keep Software ESS Adapter open while you play.
 
+### Other controllers
+
+Software ESS Adapter can also read Xbox, PlayStation, Switch Pro and most other controllers instead of the adapter. In the settings window, set Controllers to Other controllers, and skip step 1 above. The program lets go of the adapter, and reads the other controllers in its place.
+
+Each port in the settings window has a menu to pick its controller. A port keeps the controller you pick, even after a restart, and waits for it while it's unplugged. Picking a controller that's on another port swaps the two ports. Ports set to Any controller (the default) take the other controllers, in the order you plug them in. The program tells controllers apart by serial number. Some controllers don't report one, so two of the same model may swap ports after a restart.
+
+Buttons go by position: the bottom face button is A and the right one is B, as in OoT's button display and on the Gamecube and N64 controllers. Left is X and top is Y. The right shoulder button is Z, and the triggers are L and R. To use a different layout, remap the buttons in Dolphin.
+
+Full tilt straight ahead reads 105, the same as a perfect Gamecube notch. A perfectly round stick's diagonals read 74, 74, where a Gamecube's read 75, 75. Real sticks are rarely that round. Notch calibration (below) fixes both: hold the stick all the way in each direction as you calibrate.
+
 ## The main window
 
 The light in the top right corner shows whether your controller reaches the game:
@@ -56,6 +66,7 @@ Click Edit settings to open the settings window. While it's open, the game gets 
 - **Full speed from:** how far you push the stick before Link runs at full speed, in stick units. Lower it to reach full speed sooner, which also makes walking and running take less of the stick. Normally it's set for you ("auto") and changes with the ESS range. Clicking - or + sets your own, and Default goes back to auto.
 - **Software dead zone:** makes a stick that rests slightly off center read exactly 0, 0 in game. You'd only notice the difference in tools like gz. Default is 5. 0 turns it off, and it can't go past the ESS start.
 - **Notch snapping:** see Notch calibration. Off by default.
+- **Controllers:** Gamecube adapter, or Other controllers (see Other controllers).
 
 The two plots show where your stick is, one dot per controller. The colors show what Link does there. Green is ESS: hold the stick in the green to turn in place. "Your stick" is your stick, and "In game" is what the game gets.
 
@@ -75,7 +86,7 @@ Notch calibration makes your notches read exactly like a perfect controller's no
      GitHub's README editor instead, and it uploads it and puts its own link on its own line here. -->
 ![Notch calibration](docs/images/notch-calibration.gif)
 
-Calibrations belong to the adapter port, so calibrate again if you move your controller to another port.
+With the adapter, calibrations belong to the adapter port, so calibrate again if you move your controller to another port. With other controllers, the calibration and notch offsets follow the controller to whatever port it's on. Two controllers of the same model share one calibration if they don't report a serial number. The adapter's calibrations and other controllers' are kept apart, so switching Controllers doesn't lose either.
 
 ### Notch snapping
 
