@@ -8,7 +8,6 @@
 
 static constexpr uint16_t ADAPTER_VID = 0x057e;
 static constexpr uint16_t ADAPTER_PID = 0x0337;
-static constexpr int PAYLOAD_SIZE = 37;  // 1 header byte + 4 ports * 9 bytes
 static constexpr unsigned READ_TIMEOUT_MS = 100;
 
 GCAdapter::GCAdapter() {
@@ -117,24 +116,12 @@ void GCAdapter::close() {
     handle_ = nullptr;
 }
 
-GCAdapter::ReadResult GCAdapter::read(AdapterFrame& frame) {
-    uint8_t payload[PAYLOAD_SIZE];
-    int size = 0;
-    const int ret = libusb_interrupt_transfer(handle_, endpoint_in_, payload, PAYLOAD_SIZE, &size, READ_TIMEOUT_MS);
-    if (ret == LIBUSB_ERROR_TIMEOUT) {
-        return ReadResult::Timeout;
+bool parse_adapter_report(const uint8_t* report, int size, AdapterFrame& frame) {
+    if (size != ADAPTER_REPORT_SIZE || report[0] != LIBUSB_DT_HID) {
+        return false;
     }
-    if (ret != LIBUSB_SUCCESS) {
-        error_ = "Lost the adapter. Reconnecting.";
-        return ReadResult::Error;
-    }
-    // Short or non-HID reports happen for a few frames after init. Skip them.
-    if (size != PAYLOAD_SIZE || payload[0] != LIBUSB_DT_HID) {
-        return ReadResult::Timeout;
-    }
-
     for (int port = 0; port < PORT_COUNT; ++port) {
-        const uint8_t* d = &payload[1 + 9 * port];
+        const uint8_t* d = &report[1 + 9 * port];
         GCPortState& s = frame[port];
         // Bit 4 = wired controller, bit 5 = wavebird.
         s.connected = (d[0] & 0x30) != 0;
@@ -147,5 +134,20 @@ GCAdapter::ReadResult GCAdapter::read(AdapterFrame& frame) {
         s.trigger[0] = d[7];
         s.trigger[1] = d[8];
     }
-    return ReadResult::Ok;
+    return true;
+}
+
+GCAdapter::ReadResult GCAdapter::read(AdapterFrame& frame) {
+    uint8_t payload[ADAPTER_REPORT_SIZE];
+    int size = 0;
+    const int ret = libusb_interrupt_transfer(handle_, endpoint_in_, payload, ADAPTER_REPORT_SIZE, &size, READ_TIMEOUT_MS);
+    if (ret == LIBUSB_ERROR_TIMEOUT) {
+        return ReadResult::Timeout;
+    }
+    if (ret != LIBUSB_SUCCESS) {
+        error_ = "Lost the adapter. Reconnecting.";
+        return ReadResult::Error;
+    }
+    // Short or non-HID reports happen for a few frames after init. Skip them.
+    return parse_adapter_report(payload, size, frame) ? ReadResult::Ok : ReadResult::Timeout;
 }

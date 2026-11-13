@@ -41,6 +41,7 @@
 #include "ess.hpp"
 #include "ess_range.hpp"
 #include "gamepads.hpp"
+#include "gc_adapter.hpp"
 #include "ini.hpp"
 #include "notch.hpp"
 #include "port.hpp"
@@ -1114,6 +1115,38 @@ static void test_gamepad_conversion() {
     CHECK(gamepad_trigger_byte(-1) == 0);
 }
 
+// Adapter reports laid out as Dolphin's GCAdapter.cpp reads them, every byte different, so a byte
+// read from the wrong place or port shows.
+static void test_adapter_report() {
+    uint8_t report[ADAPTER_REPORT_SIZE] = {0x21};
+    const uint8_t status[PORT_COUNT] = {0x10, 0x00, 0x20, 0x04};  // wired, empty, WaveBird, power only
+    for (int port = 0; port < PORT_COUNT; ++port) {
+        uint8_t* d = &report[1 + 9 * port];
+        d[0] = status[port];
+        for (int i = 1; i < 9; ++i) {
+            d[i] = static_cast<uint8_t>(16 * (port + 1) + i);  // port 1: 0x11 to 0x18, port 2: 0x21 to 0x28 ...
+        }
+    }
+    AdapterFrame frame{};
+    CHECK(parse_adapter_report(report, sizeof(report), frame));
+    CHECK(frame[0].connected && !frame[1].connected && frame[2].connected && !frame[3].connected);
+    for (int port = 0; port < PORT_COUNT; ++port) {
+        const GCPortState& s = frame[port];
+        const int base = 16 * (port + 1);
+        CHECK(s.buttons1 == base + 1 && s.buttons2 == base + 2);
+        CHECK(s.stick[0] == base + 3 && s.stick[1] == base + 4);
+        CHECK(s.cstick[0] == base + 5 && s.cstick[1] == base + 6);
+        CHECK(s.trigger[0] == base + 7 && s.trigger[1] == base + 8);
+    }
+
+    // The short and non-HID reports after the adapter starts are skipped, and change nothing.
+    AdapterFrame untouched{};
+    CHECK(!parse_adapter_report(report, ADAPTER_REPORT_SIZE - 1, untouched));
+    report[0] = 0x22;
+    CHECK(!parse_adapter_report(report, ADAPTER_REPORT_SIZE, untouched));
+    CHECK(!untouched[0].connected && untouched[0].stick[0] == 128);
+}
+
 // A virtual SDL controller with every gamepad button and axis. Models differ by product id; SDL
 // tells Nintendo's and Sony's controllers by vendor and product id.
 static SDL_JoystickID attach_pad(const char* name, Uint16 product, Uint16 vendor = 0x1234) {
@@ -1418,6 +1451,7 @@ int main() {
     test_ini();
     test_dsu_server();
     test_delayed_sender();
+    test_adapter_report();
     test_gamepad_conversion();
     test_gamepad_ports();
     test_gamepad_buttons();
